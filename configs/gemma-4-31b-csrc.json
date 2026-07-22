@@ -1,0 +1,6 @@
+{
+  "worker_model": "gemma-4-31b",
+  "rustgen_model": "gemma-4-31b",
+  "rustgen_c_source_context": "full",
+  "concurrency": 8
+}
