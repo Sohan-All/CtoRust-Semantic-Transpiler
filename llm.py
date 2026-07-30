@@ -18,7 +18,7 @@ from openai import AsyncOpenAI
 from config import Config, MODEL_SERVERS
 
 
-def _make_client(model: str) -> AsyncOpenAI:
+def _make_client(model: str, timeout: int = 900) -> AsyncOpenAI:
     """Resolve which vLLM instance serves `model` via MODEL_SERVERS, unless
     VLLM_BASE_URL/VLLM_API_KEY are set — those still win, for one-off manual
     overrides."""
@@ -38,25 +38,39 @@ def _make_client(model: str) -> AsyncOpenAI:
                 raise SystemExit(f"No credentials: set VLLM_API_KEY or "
                                  f"create {key_file}.")
             api_key = key_file.read_text().strip()
-    # long timeout: a 26B+ model generating a 4k-token code reply can take
-    # several minutes when other requests are queued
+    # Generous but bounded: a 31B model emitting a long reply under a queued
+    # batch legitimately takes minutes, so this cannot be tight — but it was
+    # 3600, which meant a single wedged request held a run open for an hour
+    # before failing it. cfg.request_timeout.
     return AsyncOpenAI(base_url=base_url, api_key=api_key,
-                       timeout=3600, max_retries=5)
+                       timeout=timeout, max_retries=5)
+
+
+# Transient by nature: the server is unreachable, overloaded, or restarting.
+# The OpenAI client already retries these `max_retries` times; the outer loop
+# in `ask` exists for the case it cannot cover — a vLLM instance being
+# restarted, which is down for minutes and then perfectly healthy.
+_TRANSIENT = (openai.APIConnectionError, openai.APITimeoutError,
+              openai.InternalServerError, openai.RateLimitError)
 
 
 class LLM:
     def __init__(self, cfg: Config):
         self.cfg = cfg
-        self.client = _make_client(cfg.worker_model)
+        self.client = _make_client(cfg.worker_model,
+                                   getattr(cfg, "request_timeout", 900))
         self.sem = asyncio.Semaphore(cfg.concurrency)
         self.calls = 0
         self.input_tokens = 0
         self.output_tokens = 0
+        self.transport_retries = 0   # observability: how flaky was this run
 
     MAX_TOKENS_CEILING = 16000
     MIN_TOKENS_FLOOR = 512  # below this a context-length clamp gives up
 
-    async def ask(self, prompt: str, system: str | None = None, max_tokens: int | None = None) -> str:
+    async def ask(self, prompt: str, system: str | None = None,
+                  max_tokens: int | None = None,
+                  schema: dict | None = None) -> str:
         """One fresh call. Returns the text of the response.
 
         If the reply is cut off by its token budget (finish_reason ==
@@ -70,35 +84,84 @@ class LLM:
         if system:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
+        max_transport = getattr(self.cfg, "transport_retries", 3)
+        backoff = getattr(self.cfg, "retry_backoff", 5.0)
+        attempt = 0
         while True:
             async with self.sem:
                 try:
+                    extra = {"top_k": self.cfg.top_k}
+                    if schema is not None:
+                        # constrained decoding: the server may only emit tokens
+                        # that keep the output conforming, so a malformed reply
+                        # becomes impossible rather than merely unlikely. Lets
+                        # sampling stay at the model's own recommended values.
+                        extra["structured_outputs"] = {"json": schema}
                     resp = await self.client.chat.completions.create(
                         model=self.cfg.worker_model,
                         max_tokens=budget,
                         messages=messages,
+                        temperature=self.cfg.temperature,
+                        top_p=self.cfg.top_p,
+                        # top_k is not an OpenAI field; vLLM accepts it here
+                        extra_body=extra,
                     )
                 except openai.BadRequestError as e:
                     if "maximum context length" in str(e) and budget > self.MIN_TOKENS_FLOOR:
                         budget = max(budget // 2, self.MIN_TOKENS_FLOOR)
                         continue
                     raise
+                except _TRANSIENT as e:
+                    # held outside the semaphore would be better, but sleeping
+                    # inside it is deliberate: if the server is down, letting
+                    # the other three slots pile straight into the same failure
+                    # just burns the retry budget four times as fast.
+                    if attempt >= max_transport:
+                        raise
+                    delay = backoff * (2 ** attempt)
+                    attempt += 1
+                    self.transport_retries += 1
+                    print(f"[llm] {type(e).__name__} — retry {attempt}/"
+                          f"{max_transport} in {delay:.0f}s")
+                    await asyncio.sleep(delay)
+                    continue
             self.calls += 1
             if resp.usage:
                 self.input_tokens += resp.usage.prompt_tokens
                 self.output_tokens += resp.usage.completion_tokens
+            # vLLM can return a well-formed response carrying no choices (an
+            # aborted or preempted request). Indexing [0] made that an
+            # IndexError, which — before gather_units — killed the whole stage.
+            # Treat it as transient: it is a server-side hiccup, not a bad
+            # prompt, and the next draw normally succeeds.
+            if not resp.choices:
+                if attempt >= max_transport:
+                    raise RuntimeError(
+                        f"server returned no choices after {attempt} retries")
+                attempt += 1
+                self.transport_retries += 1
+                print(f"[llm] empty choices — retry {attempt}/{max_transport}")
+                continue
             choice = resp.choices[0]
             if choice.finish_reason != "length" or budget >= self.MAX_TOKENS_CEILING:
                 return choice.message.content or ""
             budget = min(budget * 2, self.MAX_TOKENS_CEILING)
 
     async def ask_json(self, prompt: str, system: str | None = None,
-                       max_tokens: int | None = None, retries: int = 2):
+                       max_tokens: int | None = None, retries: int = 2,
+                       schema: dict | None = None):
         """Fresh call expected to return a JSON object/array. Extracts the first
-        JSON value from the response (models sometimes wrap in ``` fences)."""
+        JSON value from the response (models sometimes wrap in ``` fences).
+
+        Pass `schema` to constrain decoding to it. Worth doing wherever a
+        malformed reply is expensive: an unparseable stage-S spec used to take
+        down a whole project run through asyncio.gather, having already burnt
+        the retries below. The retry path stays as a backstop for servers that
+        do not support structured outputs."""
         last_err = None
         for _ in range(retries + 1):
-            text = await self.ask(prompt, system=system, max_tokens=max_tokens)
+            text = await self.ask(prompt, system=system, max_tokens=max_tokens,
+                                  schema=schema)
             try:
                 return extract_json(text)
             except ValueError as e:
@@ -113,6 +176,7 @@ class LLM:
             "calls": self.calls,
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
+            "transport_retries": self.transport_retries,
         }
 
 

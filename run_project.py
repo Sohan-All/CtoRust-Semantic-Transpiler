@@ -28,6 +28,7 @@ import re
 import subprocess
 import sys
 import time
+import traceback
 from pathlib import Path
 
 from config import Config, CONFIG_ENV_VAR, load_config
@@ -39,6 +40,11 @@ ROOT = Path(__file__).parent
 # DIFFUSIONMTUS_OUT lets a sandboxed run (repo mounted read-only) redirect all
 # state/artifacts to a writable volume; default stays repo-local.
 OUT = Path(os.environ.get("DIFFUSIONMTUS_OUT") or (ROOT / "out"))
+
+# Exit status for an unhandled exception in a phase, distinct from argparse's 2
+# and from a deliberate SystemExit, so the harness can report CRASHED rather
+# than folding every nonzero rc into one verdict.
+CRASH_EXIT = 3
 
 
 def stem_of(fname: str) -> str:
@@ -179,7 +185,19 @@ async def phase_rustgen(c_root: Path, idx: ProjectIndex) -> None:
 
     registry: list[str] = []          # rendered sibling sigs, growing
     all_units, all_specs, all_code = [], {}, {}
+    c_lines_by_unit: dict[str, list[str]] = {}   # prefixed unit id -> its file's lines
     proj_types_parts = [shared_rs]
+    # Every stage-level fallback appends here; a non-empty list becomes a
+    # `degraded` record and the harness refuses to score the run. Surviving a
+    # failed unit is only safe if the resulting crate cannot be mistaken for a
+    # complete one — assemble() fills a missing unit with a *documented*
+    # todo!(), which illegal_stubs() deliberately permits, so the stub gate
+    # would pass it. This record is what makes the loss visible.
+    degraded: list[dict] = []
+
+    xcalls = project_call_texts(c_root, idx, cfg.split_function_over_lines)
+    xstatus = (project_exit_status(c_root, idx) if cfg.rustgen_exit_status
+               else {})
 
     order = [f for g in idx.groups for f in g]
     for fname in order:
@@ -211,6 +229,10 @@ async def phase_rustgen(c_root: Path, idx: ProjectIndex) -> None:
         mod_ns = stem.replace("-", "_") + "_deps"
         file_types = re.sub(r"\bpub(?:\(crate\))? mod deps\b",
                             f"pub mod {mod_ns}", file_types)
+        # same reason as the rename: deterministic cleanup of stage T's text
+        # before it reaches a compile loop that has no write access to it
+        from rustgen.common import demote_dangling_docs
+        file_types = demote_dangling_docs(file_types)
 
         # context for spec/code: shared types + this file's types + sibling
         # signatures (rendered as comments — the stages treat types_rs as
@@ -240,35 +262,61 @@ async def phase_rustgen(c_root: Path, idx: ProjectIndex) -> None:
         ext_callers = {fn: sorted(g for g in idx.files if g != fname
                                   and fn in idx.references.get(g, ()))
                        for fn, owner in idx.defines.items() if owner == fname}
-        extras = unit_extras(units, (c_root / fname).read_text(),
+        file_source = (c_root / fname).read_text()
+        extras = unit_extras(units, file_source,
                              cfg.split_function_over_lines,
                              cfg.rustgen_c_source_context,
                              external_callers={fn: fs for fn, fs
-                                               in ext_callers.items() if fs})
+                                               in ext_callers.items() if fs},
+                             external_call_texts=xcalls.get(fname),
+                             exit_status=xstatus.get(fname),
+                             call_sites=cfg.rustgen_call_sites,
+                             symbol_map=cfg.rustgen_symbol_map,
+                             output_formats=cfg.rustgen_output_formats)
 
+        # Both stages persist per unit as it lands (the on_result callbacks
+        # below) rather than after the parallel barrier. Writing after the
+        # barrier meant one unit raising discarded every sibling that had
+        # already succeeded, and the resume path — keyed on "did this stage
+        # produce anything at all" — then redrew the whole file. `skip` is what
+        # makes the saved work count: a resume regenerates only the units with
+        # no record, instead of all of them.
         specs = {}
         for r in store.records:
             if r.get("type") == "rust_spec" and r.get("project") == True:
                 specs[r["unit"]] = {k: v for k, v in r.items()
                                     if k not in ("type", "ts", "unit", "project")}
-        if not specs:
-            specs = await generate_specs(llm, units, ctx_types, glossary, cfg,
-                                         extras=extras)
-            for uid, spec in specs.items():
-                store.write_record({"type": "rust_spec", "unit": uid,
-                                    "project": True, **spec})
+        if set(specs) != {u.id for u in units}:
+            fresh = await generate_specs(
+                llm, units, ctx_types, glossary, cfg, extras=extras,
+                skip=set(specs), failures=degraded,
+                on_result=lambda uid, spec: store.write_record(
+                    {"type": "rust_spec", "unit": uid, "project": True, **spec}))
+            specs.update(fresh)
 
         code = {}
         for r in store.records:
             if r.get("type") == "rust_code" and r.get("project") == True:
                 code[r["unit"]] = r.get("code", "")
-        if not code or set(code) != set(specs):
-            code = await generate_code(llm, units, specs, ctx_types,
-                                       cfg.rustgen_code_max_tokens,
-                                       extras=extras)
-            for uid, rust in code.items():
-                store.write_record({"type": "rust_code", "unit": uid,
-                                    "project": True, "code": rust})
+        # only units that actually have a spec are codeable
+        want_code = {u.id for u in units} & set(specs)
+        if set(code) != want_code:
+            fresh = await generate_code(
+                llm, [u for u in units if u.id in want_code], specs, ctx_types,
+                cfg.rustgen_code_max_tokens, extras=extras,
+                skip=set(code), failures=degraded,
+                on_result=lambda uid, rust: store.write_record(
+                    {"type": "rust_code", "unit": uid, "project": True,
+                     "code": rust}))
+            code.update(fresh)
+
+        # a unit whose spec or code never materialised is missing behaviour the
+        # crate will not obviously lack — siblings stub it and it still builds
+        missing = [u.id for u in units if u.id not in code]
+        if missing:
+            degraded.append({"stage": "assemble", "file": fname,
+                             "error": f"{len(missing)} unit(s) with no code: "
+                                      f"{', '.join(sorted(missing))}"})
 
         for spec in specs.values():
             registry.extend(f"[{stem}] {s}" for s in spec.get("signatures", []))
@@ -277,8 +325,12 @@ async def phase_rustgen(c_root: Path, idx: ProjectIndex) -> None:
         code = {k: re.sub(r"(?<![A-Za-z0-9_])deps::", f"{mod_ns}::", v)
                 for k, v in code.items()}
         prefix = stem.replace("-", "_") + "__"
+        file_lines = file_source.split("\n")
         for u in units:
             all_units.append(dc.replace(u, id=prefix + u.id))
+            # a unit's ranges index ITS OWN file, so the semantic check needs
+            # that file's lines kept alongside the prefixed id
+            c_lines_by_unit[prefix + u.id] = file_lines
         all_specs.update({prefix + k: v for k, v in specs.items()})
         all_code.update({prefix + k: v for k, v in code.items()})
         print(f"[rustgen] {fname}: {len(units)} units, "
@@ -338,14 +390,90 @@ async def phase_rustgen(c_root: Path, idx: ProjectIndex) -> None:
                 {"type": "rust_code", "unit": base, "project": True,
                  "code": rust, "note": "compile-loop repaired (project)"})
         _record(pdir, {"type": "project_compile", "rounds": report.rounds,
-                       "final_errors": report.final_errors})
+                       "final_errors": report.final_errors,
+                       "stub_sections": report.stub_sections})
         # the loop repairs the TYPES section too — must persist or every
         # resume replays ~170 type errors and re-repairs them differently
         _record(pdir, {"type": "project_types_all", "types_rs": types_all})
         _record(pdir, {"type": "project_assembly", "types_rs": types_all,
                        "code": all_code, "entry_fn": entry_fn})
         print(f"[compile] project: {report.summary()}")
+
+    # Semantic checks run AFTER the compile loop, on the crate as shipped.
+    # They only REPORT: the crate is not touched, so nothing here can
+    # reintroduce a type error and no re-compile is needed.
+    if cfg.rustgen_semantic_check:
+        from rustgen.semantic_check import semantic_report
+
+        sem = semantic_report(cfg, all_units, all_specs, all_code,
+                              c_lines_by_unit, types_all)
+        _record(pdir, {"type": "project_semantic", "findings": sem.findings,
+                       "hints": sem.hints, "total": sem.total})
+        print(f"[semantic] project: {sem.summary()}")
     _record(pdir, llm.usage_record())
+
+    # Last, so it covers every stage above. Written only when something was
+    # actually lost — an absent record means a clean run, which is what the
+    # harness gate reads.
+    if degraded:
+        _record(pdir, {"type": "degraded", "count": len(degraded),
+                       "failures": degraded})
+        print(f"[degraded] {len(degraded)} unit(s)/stage(s) failed and were "
+              f"dropped — this crate is INCOMPLETE and must not be scored:")
+        for d in degraded:
+            print(f"  - {d['stage']} {d.get('unit') or d.get('file')}: "
+                  f"{d['error']}")
+
+
+def project_call_texts(c_root: Path, idx: ProjectIndex,
+                       split_over: int) -> dict[str, dict[str, list[str]]]:
+    """{defining file: {C function: call expressions used by OTHER files}}.
+
+    One pass over the project (~8ms for 5-7 files) so each file's units can be
+    told how their siblings actually invoke them. Within a file the chunker
+    already supplies this; across files the caller was previously reduced to
+    its filename, which drops the arguments — and the arguments are the
+    contract (C's parse_options(argc, argv, 2, &o) vs (argc, argv, 3, &o)).
+    """
+    from chunker import chunk
+
+    per_file: dict[str, dict[str, set[str]]] = {}
+    for fname in idx.files:
+        sites: dict[str, set[str]] = {}
+        for b in chunk((c_root / fname).read_text(), split_over).blocks:
+            for callee, texts in (getattr(b, "call_sites", {}) or {}).items():
+                sites.setdefault(callee, set()).update(texts)
+        per_file[fname] = sites
+
+    out: dict[str, dict[str, list[str]]] = {f: {} for f in idx.files}
+    for fn, owner in idx.defines.items():
+        for caller_file, sites in per_file.items():
+            if caller_file != owner and fn in sites:
+                out[owner].setdefault(fn, []).extend(sites[fn])
+    return {f: {fn: sorted(set(t)) for fn, t in m.items()} for f, m in out.items()}
+
+
+def project_exit_status(c_root: Path, idx: ProjectIndex) -> dict[str, dict]:
+    """{defining file: {C function: ExitStatus}} for functions whose return
+    value becomes the process exit status.
+
+    One pass over the project, like project_call_texts, because the flow
+    crosses files: `main` in main.c returns `cli_run`'s value from cli.c. See
+    exit_status.py for why this is return-flow and not the call graph.
+
+    Only "interesting" functions are kept — those able to return a code outside
+    {0, 1}. A function returning just 0/1 is already served correctly by the
+    idiomatic `Result` -> `Err(_) => 1` mapping, so telling its unit anything
+    would be prompt noise. Across B03_organic this keeps 21 of 1162 C functions.
+    """
+    from exit_status import analyze_project, interesting
+
+    sources = {f: (c_root / f).read_text(errors="replace") for f in idx.files}
+    out: dict[str, dict] = {f: {} for f in idx.files}
+    for (fname, fn), info in analyze_project(sources).items():
+        if interesting(info) and fname in out:
+            out[fname][fn] = info
+    return out
 
 
 def _project_block(shared_rs: str, pglossary: dict, registry: list[str],
@@ -383,18 +511,45 @@ def main() -> None:
                          "per-file run.py subprocesses via DIFFUSIONMTUS_CONFIG.")
     args = ap.parse_args()
     if args.config:
-        os.environ[CONFIG_ENV_VAR] = str(args.config)
+        # resolved: the mtu phase passes this to run.py subprocesses that run
+        # with cwd=ROOT, so a relative path works for the parent and breaks
+        # every child. The failure then surfaced three layers away as
+        # "no state.jsonl", with nothing pointing at the config path.
+        if not args.config.exists():
+            raise SystemExit(f"No such config file: {args.config}")
+        os.environ[CONFIG_ENV_VAR] = str(args.config.resolve())
     c_root = args.c_root.resolve()
 
-    idx = phase_index(c_root)
+    # Each phase is wrapped so an unhandled exception leaves a record and a
+    # distinguishable exit status instead of just a traceback on stdout. The
+    # harness previously saw only a nonzero rc and filed every cause — a crash,
+    # a missing arg, a dead server — as one TRANSLATE_FAILED.
+    def phase(name: str, fn):
+        try:
+            return fn()
+        except SystemExit:
+            raise                      # deliberate abort (e.g. "run --phase types first")
+        except KeyboardInterrupt:
+            print(f"\n[{name}] interrupted")
+            raise
+        except BaseException as e:
+            _record(project_dir(c_root),
+                    {"type": "crash", "phase": name,
+                     "error": f"{type(e).__name__}: {e}",
+                     "traceback": traceback.format_exc()})
+            print(f"[{name}] CRASHED: {type(e).__name__}: {e}", file=sys.stderr)
+            traceback.print_exc()
+            sys.exit(CRASH_EXIT)
+
+    idx = phase("index", lambda: phase_index(c_root))
     if args.phase == "index":
         return
     if args.phase in ("mtu", "all"):
-        phase_mtu(c_root, idx)
+        phase("mtu", lambda: phase_mtu(c_root, idx))
     if args.phase in ("types", "all"):
-        asyncio.run(phase_types(c_root, idx))
+        phase("types", lambda: asyncio.run(phase_types(c_root, idx)))
     if args.phase in ("rustgen", "all"):
-        asyncio.run(phase_rustgen(c_root, idx))
+        phase("rustgen", lambda: asyncio.run(phase_rustgen(c_root, idx)))
 
 
 if __name__ == "__main__":

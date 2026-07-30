@@ -6,11 +6,30 @@ signatures. The invariants are the acceptance criteria.
 
 from __future__ import annotations
 
-import asyncio
 
 from llm import LLM
 from state import Explanation
-from rustgen.common import extract_rust, render_spec, unit_block
+from rustgen.common import (extract_rust, gather_units, illegal_stubs,
+                            render_spec, unbalanced_delimiters, unit_block)
+
+# Regeneration attempts for a section that fails a pre-flight check (delimiters
+# that do not balance, or an unexplained `todo!()`). Two: both failures are
+# single-sample accidents that a fresh draw almost always fixes, and each extra
+# call costs a full section generation.
+CODE_RETRIES = 2
+
+STUB_RETRY_NOTE = """\
+Your previous reply left work unfinished: {problem}. A `todo!()` type-checks,
+so no compiler error will ever flag it — at RUN TIME it panics and takes the
+whole program down. Nothing downstream fills these in: this unit is the only
+thing that implements its own signatures. Write every body now, using the
+shared types, the sibling signatures above, and Rust std. Only if a capability
+is genuinely impossible with what you have been given may a stub remain, and
+then it MUST carry the reason: `todo!("<why>")`."""
+
+PARSE_RETRY_NOTE = """\
+Your previous reply did not parse: {problem}. Emit the COMPLETE section with
+every block closed."""
 
 CODE_PROMPT = """\
 Implement ONE behavioral unit of a program in safe, idiomatic Rust.
@@ -34,10 +53,31 @@ Rules:
 - Idiom specifics: `match` (never `if`/`else if` chains) for string->variant
   and variant->value dispatch; `&'static str` (not `String`) from fixed-text
   lookups like name/label functions; `writeln!`/`println!` instead of
-  `write!`/`print!` with a trailing `\\n`; propagate errors with `?` — never
+  `write!`/`print!` with a trailing `\\n` — see the TRAILING NEWLINE rule, the
+  `\\n` must come OUT of the format string when you switch; propagate errors
+  with `?` — never
   `.map_err(|_| ...)` that throws away the underlying error unless the
   contract pins a specific variant; infallible operations return the value
   directly, never a Result that can only be Ok.
+- TRAILING NEWLINE — exactly one newline total, counted, not guessed. The
+  `ln` in `println!`/`eprintln!`/`writeln!` appends a newline of its own, so
+  `println!("done\\n")` emits TWO and every byte-comparison against the C
+  fails. When mirroring a C `printf`/`fprintf`, count the trailing `\\n` in
+  C's format string and keep the total the same:
+    C ends with one `\\n`  -> `println!` with the `\\n` REMOVED (or `print!`
+                             keeping it — pick one, never both)
+    C ends with no `\\n`   -> `print!` / `eprint!`
+    C ends with two `\\n`  -> `println!` with ONE `\\n` left in the string
+  C `puts(s)` appends its own newline -> `println!("{{}}", s)`. This applies
+  to every line of a multi-line banner or usage text: reproduce the interior
+  newlines exactly and add none at the end. Same stream as the C —
+  `fprintf(stderr, ...)` -> `eprint!`/`eprintln!`, `printf` -> stdout.
+- EXIT STATUS IS OBSERVABLE: when this unit's C returns a value that becomes
+  the process exit status, the specific numbers are output. If the C can
+  produce more than one non-zero code (`return 1` here, `return 2` there),
+  every one must survive to the entry point — an `Err(_) => 1` catch-all that
+  reports 2 as 1 is a behavior change no compiler will flag. Honor whatever
+  the spec's signature and error_mapping chose for carrying the code.
 - API-SHAPE FIREWALL: C source or C-derived descriptions never dictate API
   shape. A C comparator returning int becomes a function returning
   `std::cmp::Ordering` (or an `Ord`/`PartialOrd` impl); a C print function
@@ -52,8 +92,10 @@ Rules:
 - ARGV: an `args: &[String]` parameter mirrors C argv — args[0] is the
   program path; subcommands and flags start at args[1]. Never match a
   command against args[0] (or `args.first()`/`args.get(0)`).
-- Every invariant listed for the unit MUST be honored. Invariants are
-  acceptance criteria, not a comment checklist. Cite an invariant in a
+- Every invariant listed for the unit MUST be honored, EXCEPT where it merely
+  restates C's in-memory representation (see the REPRESENTATION vs BEHAVIOR
+  rule above, which wins). Invariants are acceptance criteria, not a comment
+  checklist. Cite an invariant in a
   `// invariant:` comment ONLY where the code would look wrong or arbitrary
   without it. If an invariant is satisfied structurally by Rust itself
   (ownership/RAII handles a free, a `Vec` bounds-checks, a type makes a state
@@ -65,9 +107,25 @@ Rules:
   about the spec, the siblings, these instructions, design alternatives, or
   your reasoning — if you must explain a decision, do it OUTSIDE the code
   block.
-- Where C idioms were described (zero-byte terminators, manual buffers), use
-  the Rust-idiomatic equivalent unless the invariant pins the wire format —
-  wire formats must be preserved byte-for-byte.
+- REPRESENTATION vs BEHAVIOR — this OVERRIDES the invariant rule below. C's
+  in-memory representation is not observable behavior, and an invariant that
+  describes one states how C stored the data, not what the program does. A
+  Rust `String`/`Vec` carries its own length, so a terminator is never needed
+  and a literal 0 byte inside one is a BUG that shows up in the program's
+  output. Never write `.push('\\0')`, `\\0` in a string literal, or reserve
+  "+1 for the terminator".
+    "must be terminated by a zero byte"   -> just build the String; drop it
+    C `*end = '\\0'` (truncate in place)   -> `s.truncate(n)` / `&s[..n]`
+    C `strlen(buf)`                       -> `s.len()` (do NOT add or subtract 1)
+    C `char buf[N]` + manual copies        -> `String`/`Vec<u8>`, no capacity
+                                             bookkeeping
+  Satisfy such an invariant by producing the same OBSERVABLE bytes — the same
+  printed text, the same length reported to the user — never by reproducing
+  C's storage trick. The single exception is a genuine external wire format
+  (a file or socket the program reads/writes, where a real reader depends on
+  the byte layout); reproduce that byte-for-byte, and only that.
+- Where other C idioms were described (manual buffers, index bookkeeping),
+  likewise implement the behavior with Rust collections.
 - If some part is genuinely unimplementable from the information given, write
   `todo!("<what is missing>")` for that part only.
 - ALLOCATOR OWNERSHIP: Rust collections (Vec/String/Box) own their buffers —
@@ -100,10 +158,21 @@ Reply with ONLY a ```rust code block containing the implementation.
 async def generate_code(llm: LLM, units: list[Explanation],
                         specs: dict[str, dict], types_rs: str,
                         max_tokens: int,
-                        extras: dict[str, str] | None = None) -> dict[str, str]:
-    """Returns {unit_id: rust_code}. `extras` (common.unit_extras) appends
-    caller/C-source context per unit."""
+                        extras: dict[str, str] | None = None,
+                        skip: set[str] | None = None,
+                        failures: list[dict] | None = None,
+                        on_result=None) -> dict[str, str]:
+    """Returns {unit_id: rust_code} for the units actually generated. `extras`
+    (common.unit_extras) appends caller/C-source context per unit.
+
+    `skip` names units whose code is already persisted, so a resume redraws only
+    what is missing; sibling signatures still come from the full `specs` map, so
+    a skipped unit is as visible to its siblings as a freshly drawn one.
+
+    `failures` and `on_result` are passed through to common.gather_units.
+    """
     extras = extras or {}
+    skip = skip or set()
 
     def sibling_sigs_for(uid: str) -> str:
         lines = []
@@ -115,13 +184,43 @@ async def generate_code(llm: LLM, units: list[Explanation],
 
     async def code(u: Explanation) -> tuple[str, str]:
         spec = specs.get(u.id, {})
-        reply = await llm.ask(CODE_PROMPT.format(
+        prompt = CODE_PROMPT.format(
             types_rs=types_rs,
             sibling_sigs=sibling_sigs_for(u.id),
             unit=unit_block(u, extras.get(u.id, "")),
-            spec=render_spec(spec)),
-            max_tokens=max_tokens)
-        return u.id, extract_rust(reply)
+            spec=render_spec(spec))
+        # Two pre-flight checks, both regenerating the section on failure.
+        #
+        # Delimiters that do not balance make the section a PARSE error, and
+        # rustc reports one of those for the whole crate however much else is
+        # wrong — so the compile loop reads "1 error", repairs, still reads
+        # "1 error", calls that no improvement and reverts, forever. One
+        # observed run sat at `final: 1` for five rounds and never built.
+        #
+        # An unexplained `todo!()` is the mirror image: it type-checks, so the
+        # compile loop sees a CLEAN crate and reports success while the unit's
+        # behaviour is a runtime panic. The compile loop has a repair pass for
+        # these, but it is strictly cheaper and more reliable to redraw the
+        # section here, while the unit's own spec and call graph are still the
+        # prompt, than to reconstruct that context later.
+        base_prompt = prompt
+        rust, problem = "", ""
+        for attempt in range(CODE_RETRIES + 1):
+            reply = await llm.ask(prompt, max_tokens=max_tokens)
+            rust = extract_rust(reply)
+            problem = unbalanced_delimiters(rust)
+            note = PARSE_RETRY_NOTE
+            if not problem:
+                problem = illegal_stubs(rust)
+                note = STUB_RETRY_NOTE
+            if not problem:
+                return u.id, rust
+            if attempt < CODE_RETRIES:
+                prompt = base_prompt + "\n\n" + note.format(problem=problem)
+        # exhausted: hand back the last attempt rather than nothing, and say so
+        print(f"[code] {u.id}: {problem} — still present after "
+              f"{CODE_RETRIES} retries")
+        return u.id, rust
 
-    results = await asyncio.gather(*(code(u) for u in units))
-    return dict(results)
+    return await gather_units("code", [u for u in units if u.id not in skip],
+                              code, failures, on_result)

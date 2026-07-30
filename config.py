@@ -31,6 +31,15 @@ MODEL_SERVERS = {
         "base_url": "http://127.0.0.1:8001/v1",
         "api_key_file": "/nobackup2/alleshwaram/gemma4-31b-vllm/api_key.txt",
     },
+    # Second instance of the SAME weights, tensor-parallel over the other two
+    # GPUs. Two servers rather than two runs sharing one: vLLM interleaves
+    # concurrent requests into the same batches, so runs sharing an instance
+    # are coupled through batch composition — a confound when the quantity
+    # being measured is run-to-run variance.
+    "gemma-4-31b-b": {
+        "base_url": "http://127.0.0.1:8002/v1",
+        "api_key_file": "/nobackup2/alleshwaram/gemma4-31b-b-vllm/api_key.txt",
+    },
 }
 
 
@@ -40,6 +49,30 @@ class Config:
     worker_model: str = "gemma-4-26b-a4b"  # --served-model-name of the local vLLM server
     max_tokens: int = 1024
     concurrency: int = 4  # vLLM batches concurrent requests; bounded by GPU KV cache
+
+    # --- transport ---
+    # Per-request ceiling. Generous, because a 31B model emitting a 16k-token
+    # reply (LLM.MAX_TOKENS_CEILING, reached by the doubling path) under a
+    # queued batch legitimately runs into the minutes — but bounded, because
+    # the previous value of 3600 meant one wedged request stalled a whole run
+    # for an hour before failing it.
+    request_timeout: int = 900
+    # Retries AFTER the OpenAI client's own (it gives up on connection errors,
+    # 429s and 5xx after `max_retries`). These exist for the case that client
+    # cannot cover: a vLLM server being restarted, which is unreachable for
+    # minutes and then fine. Backoff is exponential from `retry_backoff`.
+    transport_retries: int = 3
+    retry_backoff: float = 5.0
+
+    # --- sampling ---
+    # Sent explicitly on every request. Left unset these fall back to the
+    # SERVER's generation_config.json (gemma-4-31b: temperature 1.0, top_p
+    # 0.95, top_k 64), which means a run's record does not describe what was
+    # actually sampled — and temperature 1.0 is why a single configuration
+    # produced divergence counts of 1, 4, 6 and 9 on the same project.
+    temperature: float = 1.0
+    top_p: float = 0.95
+    top_k: int = 64
 
     # --- syntax seeding ---
     split_function_over_lines: int = 40  # functions longer than this split one level down
@@ -70,13 +103,31 @@ class Config:
     rustgen_max_errors_per_section: int = 6  # errors quoted back per repair call
     rustgen_surgical_max_errors: int = 2     # sections at/below this get tier-1 edits first
     rustgen_deps_max_tokens: int = 1500      # sibling-stub resolution (sibling_deps.py)
+    # oracle-free omission checks after the compile loop (semantic_check.py):
+    # lost printf output text, unmapped/vanished C symbols. Diagnostic only —
+    # recorded, never repaired. The repair loop that used to follow them cost
+    # ~40% of a run's wall clock and produced byte-identical output, so only
+    # the checks survive; they add ~20ms and no LLM calls.
+    rustgen_semantic_check: bool = True
+    # Ablation switches. All default True = the shipped behaviour; each one
+    # removes exactly one prompt input so an A/B run can attribute its share
+    # of the measured gain. They are knobs for experiments, not tuning:
+    # nothing downstream should ever ship with one of these False.
+    rustgen_call_sites: bool = True       # CALL SITES block (chunker.call_sites)
+    rustgen_symbol_map: bool = True       # symbol_map in stage S + its checks
+    rustgen_output_formats: bool = True   # OUTPUT FORMATS block
+    rustgen_exit_status: bool = True      # EXIT STATUS block (exit_status.py)
     # How much of the MTU's original C the spec/code stages may see:
     #   "off"      — description + invariants only (the MTU philosophy)
     #   "literals" — just the string/char/numeric literals from the unit's C
     #                lines (seed data, output formats, constants) — data
     #                fidelity without exposing C control flow or API shape
     #   "full"     — the raw C lines, labeled reference-only
-    rustgen_c_source_context: str = "off"
+    # Default "full": measured across 7 translations of 2 projects, "off" kept
+    # 31-38% of the C's printable output fragments vs 73-90% for
+    # literals/full. The MTU philosophy is about not transliterating CONTROL
+    # FLOW; withholding the C's literal output text just loses data.
+    rustgen_c_source_context: str = "full"
 
     # --- lock check ---
     lock_regex_enabled: bool = True
