@@ -33,7 +33,9 @@ from pathlib import Path
 from config import Config
 from llm import LLM
 from state import Explanation
-from rustgen.common import extract_rust, render_spec, unit_block
+from rustgen.common import (demote_dangling_docs, emptied_blocks, extract_rust,
+                            illegal_stubs, parse_regression, render_spec,
+                            unit_block)
 
 SHARED = "__shared__"   # the types/deps region
 FFI = "__ffi__"         # the extern "C" shim layer
@@ -51,9 +53,29 @@ unit's code — do not modify or redefine the shared types or other units'
 functions (their ACTUAL current signatures are listed; call them exactly as
 listed). Keep this unit's own public function signatures exactly as they are —
 other code calls them. Preserve the unit's behavior and its `// invariant:`
-comments. If an error indicates a needed capability that genuinely cannot be
-expressed with the given types and signatures, replace only that part with
-`todo!("<what is missing>")`.
+comments.
+
+ITEM INVENTORY — your reply must contain EVERY item the current code defines:
+every `fn`, `impl` block, `struct`, `enum`, `trait`, `const` and `type`, each
+with its real body. Count the `fn`s in the code below and check your reply has
+the same ones before you send it. Fixing a compile error NEVER means deleting
+the item that failed to compile. The specific mistake to avoid is returning an
+`impl` block with its methods removed and their doc comments left behind:
+
+    impl Scheduler {{
+        /// Spawns a new task into the scheduler.
+        /// Dispatches the next available task based on the priority policy.
+    }}
+
+That still compiles, so no error will ever flag it, and every caller of
+`spawn` and `dispatch` breaks at link time or panics. If you cannot fix a
+body, reproduce it UNCHANGED and fix only what the errors name.
+
+If an error indicates a needed capability that genuinely cannot be expressed
+with the given types and signatures, replace only that part with a `todo!`
+whose message is a full sentence naming what is missing and why — e.g.
+`todo!("no sibling provides tag storage and Task has no field for it")`. A
+placeholder, or a bare function name in angle brackets, is not an explanation.
 Comment discipline: inside the code block, the ONLY comments allowed are
 `///` docs and `// invariant:` citations. Never write comments about the
 errors, the fix, the spec, other units, or your reasoning — explain nothing
@@ -146,6 +168,14 @@ a deps stub. Keep each section's `// invariant:` comments and behavior.
 Do not move code between sections. No comments about the disagreement or the
 fix — inside code, only `///` docs and `// invariant:` citations.
 
+ITEM INVENTORY: each section you return must contain EVERY item that section
+currently defines — every `fn`, `impl` block, `struct`, `enum`, `trait`,
+`const` and `type`, each with its real body. Resolving a disagreement never
+means deleting the item the two sides disagree about; change its signature or
+its callers instead. Returning an `impl` block with its methods removed and
+their doc comments left behind still compiles, so nothing will flag it, and it
+silently deletes behavior. If a section needs no change, return it verbatim.
+
 SHARED TYPES (context; only re-emit if the section list includes __shared__):
 ```rust
 {types_rs}
@@ -214,6 +244,11 @@ edits that fix them — do not reformat, rename, restructure, or touch any line
 the errors don't require. Each edit is an exact-match replacement: "find" must
 be copied VERBATIM from the code (including whitespace) and long enough to be
 unique; "replace" is its corrected form.
+
+Never use an edit to DELETE a function, method, or type — an edit whose "find"
+contains `fn name(...)` and whose "replace" drops it removes behavior other
+code depends on, and the result still compiles so nothing flags it. Fix the
+body or the signature; keep the item.
 
 CODE:
 ```rust
@@ -396,15 +431,28 @@ def split_lib(lib_rs: str) -> dict[str, str]:
 # tier 1 — surgical exact-match edits (all-or-nothing application)
 # --------------------------------------------------------------------------- #
 
+_EDIT_FN = re.compile(r"\bfn\s+(\w+)")
+
+
 def apply_surgical_edits(code_str: str, edits: list[dict]) -> str | None:
     """Apply find/replace edits; None if any find is absent (nothing applied —
-    the caller falls back to a full rewrite)."""
+    the caller falls back to a full rewrite).
+
+    An edit that drops a `fn` its own "find" contained is refused outright: the
+    prompt asks for minimal fixes, and deleting the item that failed to compile
+    is not one. That deletion still compiles, so neither rustc nor the error
+    count would object — `emptied_blocks` catches it only when the whole block
+    ends up empty, which is why it is also blocked here at the edit level.
+    """
     if not edits or len(edits) > 8:
         return None
     result = code_str
     for e in edits:
         find, replace = e.get("find"), e.get("replace")
         if not isinstance(find, str) or not isinstance(replace, str) or find not in result:
+            return None
+        dropped = set(_EDIT_FN.findall(find)) - set(_EDIT_FN.findall(replace))
+        if dropped:
             return None
         result = result.replace(find, replace, 1)
     return result
@@ -420,6 +468,17 @@ class CompileReport:
     final_errors: int = -1
     clean_units: int = 0
     total_units: int = 0
+    # sections still carrying an unexplained `todo!()` when the loop returns.
+    # Never folded into clean_units/final_errors: those count what rustc says,
+    # and rustc is happy with a stub. Reported separately so a summary line can
+    # never read "final: 0; sections clean: 17/17" for a crate that panics on
+    # first use — which is exactly what one shipped run's log said.
+    stub_sections: list[str] = field(default_factory=list)
+    # repairs refused by set_section for introducing a parse error. Surfaced in
+    # the summary because a silently dropped repair looks identical to one that
+    # simply did not help — and the difference decides whether to go read the
+    # repair prompt or the error.
+    rejected_repairs: list[dict] = field(default_factory=list)
 
     def summary(self) -> str:
         parts = []
@@ -433,8 +492,14 @@ class CompileReport:
                 t = r["tier_stats"]
                 tiers = (f"; repairs: {t['suggestions']} rustc-auto, "
                          f"{t['surgical']} surgical, {t['full']} rewrites")
+        stubs = (f"; STUBBED (compiles, panics at run time): "
+                 f"{', '.join(self.stub_sections)}" if self.stub_sections else "")
+        rej = (f"; {len(self.rejected_repairs)} repair(s) rejected as unparseable: "
+               f"{', '.join(sorted({r['section'] for r in self.rejected_repairs}))}"
+               if self.rejected_repairs else "")
         return (f"errors per round: {' -> '.join(parts)}; final: {self.final_errors}; "
-                f"MTU sections clean: {self.clean_units}/{self.total_units}{tiers}")
+                f"MTU sections clean: {self.clean_units}/{self.total_units}"
+                f"{tiers}{stubs}{rej}")
 
 
 # --------------------------------------------------------------------------- #
@@ -653,16 +718,50 @@ async def compile_loop(cfg: Config, llm: LLM, crate: Path,
             m[FFI] = ffi_rs
         return m
 
-    def set_section(sid: str, new_code: str) -> None:
+    def set_section(sid: str, new_code: str) -> bool:
+        """The single write point for every repair tier. Returns whether the
+        write was accepted.
+
+        Rejects a repair that makes a balanced section unparseable, keeping the
+        previous version. Unbalanced delimiters are a PARSE error, and rustc
+        reports exactly one of those per crate however much else is wrong — so
+        the loop reads "1 error", repairs, reads "1 error", scores that as no
+        improvement and reverts, round after round. Trial 4's `base_srvA` died
+        this way (`lib.rs:637: unexpected closing delimiter`), pinned at
+        `final: 1` through two reverts.
+
+        `unbalanced_delimiters` already guards stage C, but generation is not
+        the only writer — this is where repairs land, and nothing checked them.
+        Same shape as the stub gate's original hole: a check scoped to one
+        writer instead of every writer.
+
+        A section that was ALREADY unbalanced is still writable: the check is
+        "do not introduce a parse error", not "only ever hold balanced code",
+        and blocking there would freeze a broken section no repair could reach.
+        """
         nonlocal types_rs, ffi_rs
         if not new_code:
-            return
+            return False
+        # deterministic cleanup before the guards, same treatment stage T's
+        # text already gets: an orphaned `///` is a hard rustc error the loop
+        # cannot repair, and repairs produce them by deleting the item a doc
+        # comment belonged to. Another check that was scoped to one writer.
+        new_code = demote_dangling_docs(new_code)
+        prev = sections_code().get(sid, "")
+        problem = (parse_regression(prev, new_code)
+                   or emptied_blocks(prev, new_code))
+        if problem:
+            report.rejected_repairs.append({"section": sid, "problem": problem})
+            print(f"[compile] {sid}: repair REJECTED ({problem}) "
+                  f"— keeping previous version")
+            return False
         if sid == SHARED:
             types_rs = new_code
         elif sid == FFI:
             ffi_rs = new_code
         else:
             code[sid] = new_code
+        return True
 
     def section_label(sid: str) -> str:
         if sid == SHARED:
@@ -693,21 +792,44 @@ async def compile_loop(cfg: Config, llm: LLM, crate: Path,
             code=code.get(sid, "")),
             max_tokens=cfg.rustgen_repair_max_tokens)
         new_code = extract_rust(reply)
-        # only accept progress: fewer stubs, section not emptied
+        # only accept progress: fewer stubs, section not emptied. Routed through
+        # set_section rather than assigning code[sid] directly so the parse
+        # guard covers this writer too — de-stubbing is a rewrite like any other
+        # and can just as easily come back unbalanced.
         if new_code and new_code.count("todo!") < code[sid].count("todo!"):
-            code[sid] = new_code
+            set_section(sid, new_code)
+
+    def stubbed_sections() -> list[str]:
+        """Every section carrying an unexplained `todo!()`, MTU or not.
+
+        Deliberately spans the shared-types and FFI sections too. The earlier
+        version of this gate filtered on `sid in units_by_id`, which silently
+        excluded them — and stage T emitting an `impl` block of stubbed methods
+        into the shared section is the one failure mode that actually shipped:
+        every unit deferred to the phantom API, the crate built, and 20 of 26
+        differential cases panicked on the same line.
+        """
+        return sorted(sid for sid, c in sections_code().items()
+                      if illegal_stubs(c))
 
     # todo!() gate — stubs compile clean, so the error-driven rounds below
     # never see them; they surface as runtime panics instead (a unit deferring
     # to a sibling that never implemented the capability). One targeted pass
     # before the loop, with the REAL sibling surface as context.
-    stubbed = [sid for sid, c in code.items()
-               if "todo!" in c and sid in units_by_id]
+    stubbed = stubbed_sections()
+    # only MTU sections are repairable here: resolve_todo_stub needs the unit's
+    # behaviour and spec to write a body against. A stubbed shared-types block
+    # is prevented in stage T (which regenerates on this same check) and merely
+    # reported here — repairing it would mean inventing behaviour that belongs
+    # to whichever unit owns it.
+    repairable = [sid for sid in stubbed if sid in units_by_id]
     if stubbed:
-        await asyncio.gather(*(resolve_todo_stub(sid) for sid in stubbed))
-        remaining = [sid for sid in stubbed if "todo!" in code.get(sid, "")]
-        report.rounds.append({"todo_stubs": sorted(stubbed),
-                              "todo_remaining": sorted(remaining)})
+        if repairable:
+            await asyncio.gather(*(resolve_todo_stub(sid) for sid in repairable))
+        report.rounds.append({"todo_stubs": stubbed,
+                              "todo_unrepairable": [s for s in stubbed
+                                                    if s not in units_by_id],
+                              "todo_remaining": stubbed_sections()})
 
     async def try_surgical(sid: str, errs: list[dict]) -> bool:
         current = sections_code().get(sid, "")
@@ -721,7 +843,11 @@ async def compile_loop(cfg: Config, llm: LLM, crate: Path,
         fixed = apply_surgical_edits(current, [e for e in edits if isinstance(e, dict)])
         if fixed is None or fixed == current:
             return False
-        set_section(sid, fixed)
+        # a rejected write is not a repair: report False so the caller falls
+        # through to the next tier instead of counting a change that never
+        # landed and waiting a round to discover it
+        if not set_section(sid, fixed):
+            return False
         tier_stats["surgical"] += 1
         return True
 
@@ -859,6 +985,9 @@ async def compile_loop(cfg: Config, llm: LLM, crate: Path,
                 errors = [None] * best[0]
             report.final_errors = len(errors)
             report.clean_units = sum(1 for u in units if u.id not in dirty)
+            # recomputed on the state actually being returned: a repair round
+            # can introduce a stub as the cheapest way to make an error go away
+            report.stub_sections = stubbed_sections()
             report.rounds.append({"tier_stats": dict(tier_stats)})
             return types_rs, code, ffi_rs, report
         prev_count = len(errors)

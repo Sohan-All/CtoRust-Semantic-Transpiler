@@ -42,6 +42,13 @@ class SeedBlock:
     function: str | None = None  # enclosing/defined function name, if any
     calls_internal: list[str] = field(default_factory=list)   # names of same-file functions called
     calls_external: list[str] = field(default_factory=list)   # everything else
+    # callee name -> the DISTINCT call expressions this block makes to it.
+    # A callee's name alone does not say how it is called, and some parameters
+    # only mean anything at the call site: C's parse_options(argc, argv, 2, &o)
+    # vs (argc, argv, 3, &o) is the whole difference between "skip the
+    # subcommand" and "skip the subcommand AND its target". A unit specifying
+    # that signature in isolation cannot recover the 2-vs-3 from the body.
+    call_sites: dict[str, list[str]] = field(default_factory=dict)
     is_public: bool = False      # function without `static` (part of the C ABI surface)
     c_signature: str = ""        # declaration text up to the body, for FFI shims
 
@@ -65,6 +72,7 @@ class SeedGraph:
                     "function": b.function,
                     "calls_internal": b.calls_internal,
                     "calls_external": b.calls_external,
+                    "call_sites": b.call_sites,
                     "is_public": b.is_public,
                     "c_signature": b.c_signature,
                 }
@@ -137,6 +145,35 @@ def _collect_calls(node) -> list[str]:
     return seen
 
 
+_MAX_CALL_TEXT = 200
+_MAX_SITES_PER_CALLEE = 4
+
+
+def _collect_call_sites(node) -> dict[str, list[str]]:
+    """callee identifier -> its DISTINCT call expressions under `node`.
+
+    Distinct rather than all: three identical `f(a, b, 2)` calls carry the same
+    information as one, while a fourth `f(a, b, 3)` is exactly the fact worth
+    surfacing. Long calls are truncated — the leading arguments are the ones
+    that disambiguate."""
+    sites: dict[str, list[str]] = {}
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        if n.type == "call_expression":
+            fn = n.child_by_field_name("function")
+            if fn is not None and fn.type == "identifier":
+                name = fn.text.decode()
+                text = " ".join(n.text.decode(errors="replace").split())
+                if len(text) > _MAX_CALL_TEXT:
+                    text = text[:_MAX_CALL_TEXT] + " ...)"
+                seen = sites.setdefault(name, [])
+                if text not in seen and len(seen) < _MAX_SITES_PER_CALLEE:
+                    seen.append(text)
+        stack.extend(reversed(n.children))
+    return sites
+
+
 def _split_large_function(node, fid_base: str, name: str | None, threshold: int) -> list[SeedBlock]:
     """Split a long function one level down: header + top-level body statements.
 
@@ -176,6 +213,7 @@ def chunk(source: str, split_over: int = 40) -> SeedGraph:
 
     blocks: list[SeedBlock] = []
     fn_calls: dict[str, list[str]] = {}          # function name -> called identifiers
+    fn_call_sites: dict[str, dict[str, list[str]]] = {}  # caller -> callee -> call texts
     fn_block_ids: dict[str, list[str]] = {}      # function name -> its block ids
 
     idx = 0
@@ -190,6 +228,7 @@ def chunk(source: str, split_over: int = 40) -> SeedGraph:
             calls = _collect_calls(node)
             if name:
                 fn_calls[name] = calls
+                fn_call_sites[name] = _collect_call_sites(node)
             if end - start + 1 > split_over:
                 fblocks = _split_large_function(node, bid, name, split_over)
             else:
@@ -255,6 +294,13 @@ def chunk(source: str, split_over: int = 40) -> SeedGraph:
             calls = fn_calls[b.function]
             b.calls_internal = [c for c in calls if c in defined and c != b.function]
             b.calls_external = [c for c in calls if c not in defined]
+            # every callee, not just same-file ones: in a multi-file project
+            # roughly half the call graph crosses a file boundary (18/42 of
+            # binary_heap's functions, 24/49 of double_linked_list's), and
+            # those call sites are exactly what a unit needs to see. Consumers
+            # index this by the callees they care about, so the extra keys
+            # (libc, siblings) cost storage here and nothing downstream.
+            b.call_sites = dict(fn_call_sites.get(b.function, {}))
 
     # call edges between blocks (caller's blocks -> callee's blocks)
     edges: list[tuple[str, str]] = []
