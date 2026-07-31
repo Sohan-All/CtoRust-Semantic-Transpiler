@@ -56,13 +56,26 @@ class Config:
     # queued batch legitimately runs into the minutes — but bounded, because
     # the previous value of 3600 meant one wedged request stalled a whole run
     # for an hour before failing it.
+    # FLOOR, not the bound: llm._request_timeout scales the actual per-request
+    # wall clock with the token budget, because one fixed value cannot serve
+    # both a 512-token call and a 16000-token one. At the slow end of the
+    # observed decode rate the ceiling needs ~1070s, so 900 was unsatisfiable
+    # for it — the request could never finish, whatever the server did.
     request_timeout: int = 900
-    # Retries AFTER the OpenAI client's own (it gives up on connection errors,
-    # 429s and 5xx after `max_retries`). These exist for the case that client
-    # cannot cover: a vLLM server being restarted, which is unreachable for
-    # minutes and then fine. Backoff is exponential from `retry_backoff`.
+    # The ONLY retry layer. The OpenAI client is built with max_retries=0: it
+    # used to be 5, which silently multiplied request_timeout by six and
+    # reported nothing, and is what wedged `array_list` t4 srvA. These retries
+    # exist for a vLLM server being restarted — unreachable for minutes, then
+    # fine. Backoff is exponential from `retry_backoff`, and every retry is
+    # printed and counted into the run's `transport_retries`.
     transport_retries: int = 3
     retry_backoff: float = 5.0
+    # Backstop on ONE logical LLM call end to end — every request it issues,
+    # including budget doublings and transport retries. Each of those is
+    # individually bounded; nothing bounded their product, which is how a
+    # single call sat for 38 minutes writing nothing to the log. Generous
+    # enough that only a pathological call reaches it.
+    call_deadline: int = 2700
 
     # --- sampling ---
     # Sent explicitly on every request. Left unset these fall back to the

@@ -9,9 +9,14 @@ Two modes (cfg.rustgen_spec_mode):
   independently (and incompatibly — spec/impl drift, cross-MTU duplicates,
   void* leakage were all observed consequences of the thin mode).
 
-Rich mode runs a single global RESPONSIBILITY ASSIGNMENT call first: concerns
-that exactly one unit must own (Drop impls, shared helpers, trait impls) are
-assigned to specific MTUs, so no two units implement the same item.
+Rich mode runs a RESPONSIBILITY ASSIGNMENT call first: concerns that exactly
+one unit must own (Drop impls, shared helpers, trait impls, methods on a shared
+type) are assigned to specific MTUs, so no two units implement the same item.
+
+Its scope is the whole PROJECT, not one file — run_project.py calls
+`assign_responsibilities` once over every file's units and passes the result
+in. A per-file pass cannot see a duplicate that spans files, and that is where
+they occur; see that function's docstring for the measurement.
 
 In both modes the spec ADDS to the MTU, never replaces it: codegen always
 receives the MTU description + invariants alongside — the invariants remain
@@ -27,15 +32,29 @@ from state import Explanation
 from rustgen.common import gather_units, unit_block
 
 RESPONSIBILITY_PROMPT = """\
-A C file has been decomposed into the behavioral units below, to be
-reimplemented in Rust against the shared types below. Some concerns must be
-implemented by EXACTLY ONE unit or the crate will not compile: Drop/Default/
-trait impls for a shared type, a helper several units need, a constructor.
+A C program has been decomposed into the behavioral units below, to be
+reimplemented in Rust against the shared types below. Every unit is generated
+SEPARATELY and in PARALLEL, seeing only these shared types and its siblings'
+signatures — so if two units both decide to write the same item, both will,
+and the crate will not compile.
+
+The units below may come from SEVERAL C files. A unit id of the form
+`<file>__<unit>` names its file. Two units in different files duplicating one
+item is the most common form of this failure and the one you are best placed
+to catch: each file's own author sees only its own file, where the item looks
+private and unremarkable. A method on a SHARED type is never private to one
+file — if `project.c` and `demo.c` both need to look up a task, that is ONE
+concern with ONE owner, not two private helpers.
+
+Some concerns must therefore be implemented by EXACTLY ONE unit: Drop/Default/
+trait impls for a shared type, a helper several units need, a constructor, and
+any method on a shared type that more than one unit's behavior relies on.
 
 List each such single-owner concern and assign it to the one unit whose
 behavior it belongs to (resource-release behavior owns Drop; construction
-behavior owns the constructor). Only list genuinely shared concerns — a
-function obviously private to one unit needs no assignment.
+behavior owns the constructor; the unit whose described behavior IS the lookup
+owns the lookup). Only list genuinely shared concerns — a function private to
+one unit, operating only on that unit's own local data, needs no assignment.
 
 NEVER create a Drop concern for a type whose cleanup is plain RAII (fields
 are String/Vec/Box/Option that free themselves) — that describes C's free()
@@ -48,6 +67,14 @@ assigned to the unit owning that behavior: a comparator for a type ->
 `impl Ord`/`PartialOrd`; a print/format function for a type ->
 `impl std::fmt::Display`; a parse-from-text function -> `impl FromStr`.
 These are the idiomatic Rust surface for compare/print/parse behavior.
+
+ONLY for types THIS CRATE defines. Rust's orphan rule forbids implementing a
+std trait for a type you do not own, so `impl FromStr for i32`,
+`impl Display for String` and `impl Ord for u32` are all illegal and will not
+compile — there is no way to write them. A function that parses text into a
+primitive (`&str` -> `i32`) is a plain function, e.g.
+`parse_priority(s: &str) -> Result<i32, E>`, never a trait impl. Check the
+target type against the shared types above before proposing any trait impl.
 
 SHARED TYPES (may begin with an `// API CONTRACT` block — its conventions are binding on every signature you design; may end with a SIBLING MODULE FUNCTIONS list — those are implemented elsewhere in this crate; design signatures that CALL them, never re-specify them):
 ```rust
@@ -77,7 +104,10 @@ decision the implementer would otherwise have to guess:
   the value directly, never a Result that can only be Ok. C shapes never
   survive into signatures: comparator-returning-int -> `Ordering` (or an
   `Ord`/`PartialOrd` impl), print-function-for-a-type -> `impl Display`,
-  int-as-bool -> `bool`, out-parameter -> return value. An `args: &[String]`
+  int-as-bool -> `bool`, out-parameter -> return value. Those trait impls are
+  legal ONLY for types this crate defines — the orphan rule makes
+  `impl Display for String` or `impl FromStr for i32` impossible to write, so
+  text->primitive parsing is a plain function. An `args: &[String]`
   parameter mirrors C argv: args[0] is the program path; real arguments
   (subcommands, flags) start at args[1].
 - "ownership": one entry per parameter/return worth deciding: who owns it,
@@ -164,7 +194,9 @@ operates on one of the shared types, free functions otherwise; Result<_,
 `pub(crate)` — the crate's only `pub` items are the program entry point and
 FFI exports. C shapes never survive into signatures: comparator-returning-int
 -> `Ordering`, print-function-for-a-type -> `impl Display`, int-as-bool ->
-`bool`, out-parameter -> return value. Display/print/report behavior must
+`bool`, out-parameter -> return value — trait impls only for types this crate
+defines, since the orphan rule makes `impl FromStr for i32` and
+`impl Display for String` impossible. Display/print/report behavior must
 guarantee emission: print directly, or note which caller prints the returned
 value — never a report nobody prints.
 
@@ -240,17 +272,23 @@ async def generate_specs(llm: LLM, units: list[Explanation], types_rs: str,
                          extras: dict[str, str] | None = None,
                          skip: set[str] | None = None,
                          failures: list[dict] | None = None,
-                         on_result=None) -> dict[str, dict]:
+                         on_result=None,
+                         concerns: list[dict] | None = None,
+                         id_prefix: str = "") -> dict[str, dict]:
     """Returns {unit_id: spec dict} for the units actually generated. Every spec
     has at least "signatures" and "behavior_note"; rich mode adds the
     design-decision fields. `extras` (common.unit_extras) appends caller/C-source
     context per unit.
 
     `skip` names units whose specs are already persisted, so a resume redraws
-    only what is missing. They stay in `units` regardless: rich mode's
-    responsibility assignment is a single global pass over the whole file, and
-    running it on a subset would hand the remaining units a different ownership
-    split from the one the persisted specs were written against.
+    only what is missing. They stay in `units` regardless: the ownership split
+    must be the same one the persisted specs were written against.
+
+    `concerns` (rich mode) is a responsibility assignment already made over a
+    wider scope — pass it from run_project.py, which assigns once across the
+    whole project. Owners there are named `<stem>__<unit>`, so `id_prefix`
+    qualifies these file-local unit ids to match. Omit both and rich mode
+    assigns over just `units`, which is what single-file translation wants.
 
     `failures` and `on_result` are passed through to common.gather_units — a
     unit that raises is dropped and recorded rather than killing the stage.
@@ -258,7 +296,7 @@ async def generate_specs(llm: LLM, units: list[Explanation], types_rs: str,
     if cfg.rustgen_spec_mode == "rich":
         return await _generate_rich(llm, units, types_rs, glossary, cfg,
                                     extras or {}, skip or set(), failures,
-                                    on_result)
+                                    on_result, concerns, id_prefix)
     return await _generate_thin(llm, units, types_rs, glossary,
                                 cfg.rustgen_spec_max_tokens, extras or {},
                                 skip or set(), failures, on_result)
@@ -285,21 +323,30 @@ async def _generate_thin(llm: LLM, units: list[Explanation], types_rs: str,
                               spec, failures, on_result)
 
 
-async def _generate_rich(llm: LLM, units: list[Explanation], types_rs: str,
-                         glossary: dict, cfg: Config,
-                         extras: dict[str, str], skip: set[str],
-                         failures: list[dict] | None,
-                         on_result) -> dict[str, dict]:
-    # global pass: single-owner concerns, so no two units emit the same item.
-    # Guarded because it runs before any unit does: an unparseable reply here
-    # used to abort the whole project at the start of its most expensive stage.
-    # Losing the assignment costs cross-unit coordination, not correctness —
-    # every unit still gets a spec — so it degrades rather than aborts.
+async def assign_responsibilities(llm: LLM, units: list[Explanation],
+                                  types_rs: str, max_tokens: int = 2000,
+                                  failures: list[dict] | None = None
+                                  ) -> list[dict]:
+    """One pass over `units`, returning validated [{"concern", "owner"}] — the
+    items exactly one unit may emit, so no two units emit the same one.
+
+    Call this over EVERY unit in the project, with project-scoped ids
+    (`<stem>__<unit>`), not once per file. Run per-file it cannot see a
+    duplicate that spans files, which is where they actually occur: all four
+    duplicate definitions that BUILD_FAILED both `array_list` t3 arms crossed a
+    file boundary, and each was legitimately single-owner within its own file.
+    Same defect the chunker had before `project_call_texts()`.
+
+    Guarded because it runs before any unit does: an unparseable reply here
+    used to abort the whole project at the start of its most expensive stage.
+    Losing the assignment costs cross-unit coordination, not correctness —
+    every unit still gets a spec — so it degrades rather than aborts.
+    """
     try:
         resp = await llm.ask_json(RESPONSIBILITY_PROMPT.format(
             types_rs=types_rs,
             units="\n\n".join(unit_block(u) for u in units)),
-            max_tokens=2000, schema=RESPONSIBILITY_SCHEMA)
+            max_tokens=max_tokens, schema=RESPONSIBILITY_SCHEMA)
     except Exception as e:
         print(f"[spec] responsibility assignment FAILED "
               f"({type(e).__name__}: {e}) — proceeding unassigned, "
@@ -309,8 +356,28 @@ async def _generate_rich(llm: LLM, units: list[Explanation], types_rs: str,
                              "error": f"{type(e).__name__}: {e}"})
         resp = None
     concerns = resp.get("concerns", []) if isinstance(resp, dict) else []
-    concerns = [c for c in concerns
-                if isinstance(c, dict) and c.get("concern") and c.get("owner")]
+    return [c for c in concerns
+            if isinstance(c, dict) and c.get("concern") and c.get("owner")]
+
+
+async def _generate_rich(llm: LLM, units: list[Explanation], types_rs: str,
+                         glossary: dict, cfg: Config,
+                         extras: dict[str, str], skip: set[str],
+                         failures: list[dict] | None,
+                         on_result, concerns: list[dict] | None = None,
+                         id_prefix: str = "") -> dict[str, dict]:
+    # `concerns` supplied => a project-scoped pass already ran over every file's
+    # units; do not re-run it here. None => single-file translation (run.py),
+    # which assigns over just these units, as before.
+    if concerns is None:
+        concerns = await assign_responsibilities(llm, units, types_rs,
+                                                 failures=failures)
+
+    # Owners are named with whatever id scope the pass used. Project-scoped
+    # ids are `<stem>__<unit>` while `units` here still carry file-local ids,
+    # so qualify before comparing; id_prefix is "" in the single-file path.
+    def owner_id(u: Explanation) -> str:
+        return id_prefix + u.id
 
     def assignments_for(uid: str) -> str:
         owns = [c["concern"] for c in concerns if c["owner"] == uid]
@@ -327,7 +394,7 @@ async def _generate_rich(llm: LLM, units: list[Explanation], types_rs: str,
     async def spec(u: Explanation) -> tuple[str, dict]:
         r = await llm.ask_json(RICH_SPEC_PROMPT.format(
             types_rs=types_rs, glossary=glossary,
-            assignments=assignments_for(u.id),
+            assignments=assignments_for(owner_id(u)),
             symbol_map_bullet=SYMBOL_MAP_BULLET if want_symbols else "",
             symbol_map_key=', "symbol_map": [...]' if want_symbols else "",
             unit=unit_block(u, extras.get(u.id, ""))),
@@ -339,8 +406,10 @@ async def _generate_rich(llm: LLM, units: list[Explanation], types_rs: str,
         r.setdefault("behavior_note", "")
         r.setdefault("symbol_map", [])
         # authoritative assignment beats whatever the model echoed back
-        r["owns"] = [c["concern"] for c in concerns if c["owner"] == u.id]
-        r["must_not_implement"] = [c["concern"] for c in concerns if c["owner"] != u.id]
+        mine = owner_id(u)
+        r["owns"] = [c["concern"] for c in concerns if c["owner"] == mine]
+        r["must_not_implement"] = [c["concern"] for c in concerns
+                                   if c["owner"] != mine]
         return u.id, r
 
     return await gather_units("spec", [u for u in units if u.id not in skip],

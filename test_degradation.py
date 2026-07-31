@@ -748,6 +748,236 @@ def test_repair_prompts_still_format() -> None:
           "<what is missing>" not in out and "not an explanation" in out)
 
 
+def test_emptied_blocks_both_fixtures() -> None:
+    """Both real fixtures at once — the two-sided check whose absence let a
+    deduplication exemption get written and reverted.
+
+    They pull in opposite directions only if you misread the second one: in
+    binary_heap base_srvB_t2 the surviving copy of `compare` is the STUB and
+    the deleted one is the real implementation, so refusing is correct there
+    too. Any future relaxation must keep BOTH of these rejected.
+    """
+    print("\n=== emptied_blocks: both real fixtures stay rejected ===")
+    import json
+    import re
+    from pathlib import Path
+    from rustgen.common import emptied_blocks
+
+    runs = Path("/nobackup2/alleshwaram/mtu_runs/abl2/runs")
+    if not runs.exists():
+        print("  SKIP  runs not on disk")
+        return
+
+    state = (runs / "binary_heap_base_srvB_t1/_project_B03_organic"
+                    "/files/scheduler/state.jsonl")
+    if state.exists():
+        vs = [json.loads(l) for l in state.read_text().splitlines() if l.strip()]
+        vs = [r for r in vs
+              if r.get("type") == "rust_code" and r["unit"] == "exp_0003"]
+        check("t1 gutting (spawn/dispatch/peek vanish) stays rejected",
+              emptied_blocks(vs[0]["code"], vs[-1]["code"]) != "")
+
+    lib = (runs / "binary_heap_base_srvB_t2/_project_B03_organic"
+                  "/rust_crate/src/lib.rs")
+    if lib.exists():
+        crate = lib.read_text()
+        sec = [s for s in re.split(r"^// ===== ", crate, flags=re.M)
+               if s.startswith("MTU scheduler__exp_0001")]
+        if sec:
+            sched = sec[0]
+            deduped = re.sub(r"pub\(crate\) fn compare.*?\n    \}", "",
+                             sched, flags=re.S)
+            check("t2 'dedup' stays rejected — it deletes the REAL impl and "
+                  "keeps the stub", emptied_blocks(sched, deduped) != "")
+
+
+def test_types_stage_records_exhaustion() -> None:
+    """Stage T giving up on its stub gate must leave a record, not just a
+    printed warning. binary_heap base_srvB_t2 died of this and the only
+    evidence was two lines of stdout."""
+    print("\n=== types_stage: exhausted stub gate is recorded ===")
+    from rustgen.types_stage import synthesize_types
+
+    stubbed = ("```rust\npub struct S { pub a: i32 }\n"
+               "impl S { pub fn f(&self) -> i32 { todo!() } }\n```\n"
+               'GLOSSARY:\n```json\n{"thing": "S"}\n```')
+    clean = ("```rust\npub struct S { pub a: i32 }\n```\n"
+             'GLOSSARY:\n```json\n{"thing": "S"}\n```')
+    unit = Explanation(id="exp_0001", text="does a thing", invariants=[],
+                       ranges=[(1, 5)], status="locked")
+
+    failures: list[dict] = []
+    rs, _ = asyncio.run(synthesize_types(_FakeReplyLLM(stubbed), [unit], 100,
+                                         failures=failures))
+    check("exhaustion is recorded so the run cannot score",
+          len(failures) == 1 and failures[0]["stage"] == "types",
+          str(failures))
+    check("the record names the surviving problem",
+          failures and "stub gate exhausted" in failures[0]["error"],
+          str(failures))
+
+    failures = []
+    rs, _ = asyncio.run(synthesize_types(_FakeReplyLLM(clean), [unit], 100,
+                                         failures=failures))
+    check("a clean stage T records nothing", not failures, str(failures))
+
+
+def test_orphan_rule_in_prompts() -> None:
+    print("\n=== prompts: the orphan rule is stated where impls are suggested ===")
+    import rustgen.spec_stage as ss
+    import rustgen.code_stage as cs
+
+    for name, tmpl in [("RESPONSIBILITY_PROMPT", ss.RESPONSIBILITY_PROMPT),
+                       ("RICH_SPEC_PROMPT", ss.RICH_SPEC_PROMPT),
+                       ("SPEC_PROMPT", ss.SPEC_PROMPT),
+                       ("CODE_PROMPT", cs.CODE_PROMPT)]:
+        has_impl_advice = "impl Display" in tmpl or "impl FromStr" in tmpl
+        has_orphan = "orphan rule" in tmpl.lower()
+        check(f"{name} qualifies its trait-impl advice",
+              has_orphan if has_impl_advice else True)
+
+
+def test_one_call_is_bounded() -> None:
+    """`array_list` t4 srvA: one call held a run for 38 minutes writing nothing.
+
+    Three multipliers stacked. The client was built with max_retries=5, so
+    `request_timeout=900` was a per-ATTEMPT bound and the real one was 6x that;
+    `ask` doubles the budget on a truncated reply, giving a second round of the
+    same; and nothing bounded the product. None of it was reported, because the
+    client's internal retries emit no log line and touch no counter — from
+    inside the run a 90-minute wedge looked exactly like a slow call.
+    """
+    print("\n=== transport: one logical call is bounded and reports ===")
+    import dataclasses
+    import openai
+    import llm as llm_mod
+    from config import Config
+    cfg = Config()
+
+    client = llm_mod._make_client("gemma-4-31b", cfg.request_timeout)
+    check("client does not retry behind our back (max_retries=0)",
+          client.max_retries == 0, f"max_retries={client.max_retries}")
+
+    rt = llm_mod._request_timeout
+    check("per-request timeout never drops below the configured floor",
+          all(rt(b, cfg.request_timeout) >= cfg.request_timeout
+              for b in (512, 4000, 16000)))
+    check("per-request timeout grows with the budget",
+          rt(16000, cfg.request_timeout) > rt(4000, cfg.request_timeout))
+
+    # The trap itself: MAX_TOKENS_CEILING and request_timeout were mutually
+    # unsatisfiable. A 16000-token reply needs ~1070s at the slow end of the
+    # observed decode rate, so it could NEVER complete inside 900s.
+    ceiling = llm_mod.LLM.MAX_TOKENS_CEILING
+    needed = ceiling / llm_mod._MIN_DECODE_RATE
+    check("the token ceiling is reachable within its own timeout",
+          rt(ceiling, cfg.request_timeout) >= needed,
+          f"{rt(ceiling, cfg.request_timeout):.0f}s allowed, {needed:.0f}s needed")
+    check("known-bad: the old fixed 900s could not have reached the ceiling",
+          900 < needed, f"{needed:.0f}s needed")
+
+    # call_deadline is the backstop on the product. Drive it with a client that
+    # always times out, and assert the loop gives up rather than spinning.
+    class _AlwaysTimeout:
+        def __init__(self):
+            self.attempts = 0
+
+        class _Completions:
+            def __init__(self, outer):
+                self.outer = outer
+
+            async def create(self, **kw):
+                self.outer.attempts += 1
+                raise openai.APITimeoutError(request=None)
+
+        @property
+        def chat(self):
+            outer = self
+
+            class _Chat:
+                completions = _AlwaysTimeout._Completions(outer)
+            return _Chat()
+
+    cfg2 = dataclasses.replace(Config(), call_deadline=1, retry_backoff=0.01,
+                               transport_retries=2)
+    obj = llm_mod.LLM.__new__(llm_mod.LLM)
+    obj.cfg = cfg2
+    obj.client = _AlwaysTimeout()
+    obj.sem = asyncio.Semaphore(1)
+    obj.calls = obj.input_tokens = obj.output_tokens = 0
+    obj.transport_retries = 0
+    try:
+        asyncio.run(obj.ask("hi", max_tokens=512))
+        check("a call that never succeeds raises", False, "returned normally")
+    except Exception as e:
+        check("a call that never succeeds raises, bounded",
+              isinstance(e, (TimeoutError, openai.APITimeoutError)),
+              f"{type(e).__name__}: {e}")
+    check("every retry it did make was counted",
+          obj.transport_retries >= 1, f"{obj.transport_retries} counted")
+
+
+def test_missing_item_routes_to_owner() -> None:
+    """A missing item must reach the section that should DEFINE it.
+
+    `_name_lookup` picked a cross-section repair partner by searching for the
+    section defining the missing name — but for a MISSING item nothing defines
+    it anywhere, which is the whole error. It returned None, the cluster
+    collapsed to the caller alone, and the repair was handed the one section
+    that cannot fix it. Compounding that, `no associated function or constant
+    named` was in neither name regex, so the commonest form (`Type::new`, 27 of
+    36 recorded E0599s) did not even reach the lookup.
+    """
+    print("\n=== repair routing: a missing item reaches its owner ===")
+    from rustgen.compile_loop import (_name_lookup, _base_type, _impl_owner,
+                                      _NAME_ERR, missing_capability_notes)
+
+    for raw, want in [("&Project", "Project"), ("&mut Vec<T>", "Vec"),
+                      ("Activity", "Activity"), ("crate::Task", "Task")]:
+        check(f"_base_type({raw!r}) -> {want}", _base_type(raw) == want,
+              _base_type(raw))
+
+    secs = {
+        "activity__exp_0001": "impl Activity {\n  fn as_str(&self) -> &str { \"\" }\n}",
+        "activity__exp_0003": "impl fmt::Display for Activity {\n  fn fmt(&self) {}\n}",
+        "demo__exp_0007": "fn demo() { let a = Activity::new(1); }",
+        "project__exp_0001": "impl Project {\n  fn find_task(&self) -> u8 { 0 }\n}",
+    }
+    NEW = "no associated function or constant named `new` found for struct `Activity` in the current scope"
+    MUT = "no method named `find_task_mut` found for reference `&Project` in the current scope"
+    STD = "no method named `num_entries` found for struct `Vec<BuildJob>` in the current scope"
+
+    check("known-bad: the old regex missed `no associated function`",
+          "no associated function or constant named" in _NAME_ERR.pattern)
+    check("a missing constructor routes to the type's inherent impl",
+          _name_lookup({"message": NEW}, secs) == "activity__exp_0001",
+          str(_name_lookup({"message": NEW}, secs)))
+    check("it does NOT route to the trait impl for the same type",
+          _name_lookup({"message": NEW}, secs) != "activity__exp_0003")
+    check("a missing &mut variant routes to the type's owner",
+          _name_lookup({"message": MUT}, secs) == "project__exp_0001",
+          str(_name_lookup({"message": MUT}, secs)))
+    check("a missing method on a std type routes NOWHERE (caller's bug)",
+          _name_lookup({"message": STD}, secs) is None,
+          str(_name_lookup({"message": STD}, secs)))
+    check("an unknown type routes nowhere rather than guessing",
+          _impl_owner("Nonexistent", secs) is None)
+
+    # the definer path still wins when the name DOES exist somewhere
+    HAVE = "no method named `as_str` found for struct `Activity` in the current scope"
+    check("a name defined somewhere still routes to its definer",
+          _name_lookup({"message": HAVE}, secs) == "activity__exp_0001")
+
+    note = missing_capability_notes([{"message": NEW}], secs)
+    check("the note names where the item belongs",
+          "impl Activity" in note, note[:90])
+    check("...and does not tell the caller to reimplement it privately",
+          "private helper in the calling section" in note, note[:90])
+    note_std = missing_capability_notes([{"message": STD}], secs)
+    check("a std-type miss still gets the implement-here note",
+          "inline" in note_std, note_std[:90])
+
+
 def main() -> int:
     test_gather_units_survives()
     test_on_result_fires_before_later_failure()
@@ -769,6 +999,11 @@ def main() -> int:
     test_remaining_stubs_on_real_crates()
     test_surgical_edits_cannot_delete()
     test_repair_prompts_still_format()
+    test_emptied_blocks_both_fixtures()
+    test_types_stage_records_exhaustion()
+    test_orphan_rule_in_prompts()
+    test_one_call_is_bounded()
+    test_missing_item_routes_to_owner()
     print()
     if _failures:
         print(f"{len(_failures)} FAILURE(S):")

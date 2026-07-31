@@ -209,7 +209,10 @@ COMPLETE list of what other units actually provide. If a stub's capability is
 listed there, call it. Otherwise NO other unit provides it — implement it
 yourself now, using only the shared types, the sibling signatures, and Rust
 std. Keep this unit's signatures exactly as they are. Only if the capability
-is genuinely impossible with the given types may a `todo!("<why>")` remain.
+is genuinely impossible with the given types may a `todo!` remain, and then its
+message MUST be a full sentence naming what is missing and why — e.g.
+`todo!("no sibling provides tag storage and Task has no field for it")`. A
+placeholder, or a bare function name in angle brackets, is not an explanation.
 Comment discipline: inside the code block, only `///` docs and
 `// invariant:` citations — nothing about the stubs, the spec, or your
 reasoning.
@@ -561,12 +564,71 @@ def _all_span_lines(err: dict) -> list[int]:
     return lines
 
 
-_NAME_ERR = re.compile(r"cannot find (?:function|value|type|method)|no method named|no function or associated item|no variant, associated function, or constant named")
+# `no associated function or constant named` was missing from both of these
+# and is the single most common form in the recorded logs — 27 of the 36
+# surviving E0599s, almost all of them `Type::new`. Its absence meant
+# `_name_lookup` returned before it looked at anything and
+# `missing_capability_notes` never fired, so a caller of a constructor nobody
+# wrote got neither a cross-section repair partner nor the note telling it the
+# function does not exist. Keep the two patterns in step.
+_NAME_ERR = re.compile(
+    r"cannot find (?:function|value|type|method)"
+    r"|no method named"
+    r"|no function or associated item"
+    r"|no associated function or constant named"
+    r"|no variant, associated function, or constant named")
 _BACKTICKED = re.compile(r"`(\w+)`")
 
 _MISSING_NAME = re.compile(
     r"cannot find (?:function|value|method) `(\w+)`"
-    r"|no (?:method|function or associated item|variant, associated function, or constant) named `(\w+)`")
+    r"|no (?:method"
+    r"|function or associated item"
+    r"|associated function or constant"
+    r"|variant, associated function, or constant) named `(\w+)`")
+
+# "... found for struct `Activity`", "... for reference `&Project`",
+# "... for struct `Vec<BuildJob>`". The receiver is what the missing item
+# should hang off, which is the only clue to its owner when nothing defines it.
+_RECEIVER = re.compile(
+    r"found for (?:struct|enum|reference|type|union|trait|opaque type)?\s*`([^`]+)`")
+
+
+def _base_type(text: str) -> str:
+    """`&mut Vec<BuildJob>` -> `Vec`. The bare name is what an impl header
+    carries, so that is what we match sections against."""
+    t = text.strip().lstrip("&").strip()
+    if t.startswith("mut "):
+        t = t[4:].strip()
+    t = t.split("<", 1)[0]
+    return t.strip().split("::")[-1]
+
+
+def _impl_owner(type_name: str, sections_code: dict[str, str]) -> str | None:
+    """The section carrying an inherent `impl <type_name>`.
+
+    Where a missing item BELONGS, as opposed to where it is defined — for an
+    item that is missing, nowhere defines it, which is the whole error. Only
+    inherent impls count: `impl Display for Activity` is a different section's
+    business and adding `new` to it would not compile.
+    """
+    if not type_name or type_name in _STD_TYPES:
+        return None
+    pat = re.compile(rf"\bimpl(?:<[^>]*>)?\s+{re.escape(type_name)}\b\s*(?:<[^>]*>\s*)?\{{")
+    for sid, code_str in sections_code.items():
+        if pat.search(code_str):
+            return sid
+    return None
+
+
+# A missing method on a std type is a real caller bug — the caller invented an
+# API. Routing it to whoever happens to mention Vec would send the repair to an
+# innocent section, so these deliberately resolve to no owner.
+_STD_TYPES = {
+    "Vec", "String", "str", "Option", "Result", "Box", "HashMap", "HashSet",
+    "BTreeMap", "BTreeSet", "VecDeque", "Iterator", "Path", "PathBuf", "Rc",
+    "Arc", "RefCell", "Cell", "Cow", "i8", "i16", "i32", "i64", "isize",
+    "u8", "u16", "u32", "u64", "usize", "f32", "f64", "bool", "char",
+}
 
 
 def missing_capability_notes(errs: list[dict], sections_code: dict[str, str]) -> str:
@@ -574,36 +636,74 @@ def missing_capability_notes(errs: list[dict], sections_code: dict[str, str]) ->
     a note telling the repair to implement the behavior instead of keeping
     the phantom call — the model otherwise stalls, re-calling a capability
     it keeps assuming some sibling provides."""
-    missing: list[str] = []
+    missing: list[tuple[str, str | None]] = []
+    seen: set[str] = set()
     for e in errs:
-        m = _MISSING_NAME.search(e.get("message", ""))
+        msg = e.get("message", "")
+        m = _MISSING_NAME.search(msg)
         if not m:
             continue
         name = m.group(1) or m.group(2)
-        if name in missing:
+        if name in seen:
             continue
         pat = re.compile(rf"\bfn\s+{re.escape(name)}\b")
-        if not any(pat.search(c) for c in sections_code.values()):
-            missing.append(name)
+        if any(pat.search(c) for c in sections_code.values()):
+            continue
+        seen.add(name)
+        # If the message names a receiver whose inherent impl lives in this
+        # cluster, say where the item BELONGS. Without this the note tells
+        # whichever section is being repaired to implement it "right here",
+        # which is the opposite of what routing it to the owner achieved —
+        # the caller would grow a private duplicate of a method the owning
+        # type should carry, and that is how duplicate definitions start.
+        rm = _RECEIVER.search(msg)
+        owner_type = _base_type(rm.group(1)) if rm else None
+        if owner_type and owner_type in _STD_TYPES:
+            owner_type = None
+        missing.append((name, owner_type))
     if not missing:
         return ""
-    return "\n\n" + "\n".join(
-        f"NOTE: `{n}` does not exist ANYWHERE in this crate — no unit "
-        f"implements it and none will. Do not keep calling it: implement the "
-        f"behavior inline (or as a private helper) right here."
-        for n in missing)
+    out = []
+    for n, ty in missing:
+        head = (f"NOTE: `{n}` does not exist ANYWHERE in this crate — no unit "
+                f"implements it and none will. Do not keep calling it: ")
+        out.append(head + (
+            f"add it to `impl {ty}` in whichever section below owns that type, "
+            f"with the signature the call site needs. Do NOT reimplement it as "
+            f"a private helper in the calling section."
+            if ty else
+            "implement the behavior inline (or as a private helper) right here."))
+    return "\n\n" + "\n".join(out)
 
 
 def _name_lookup(err: dict, sections_code: dict[str, str]) -> str | None:
-    """For one-span name errors: which section defines (or should define) the
-    missing identifier?"""
-    if not _NAME_ERR.search(err.get("message", "")):
+    """For one-span name errors: which section defines, OR SHOULD DEFINE, the
+    missing identifier?
+
+    Both halves matter and only the first was ever implemented. Searching for
+    the section that DEFINES the name answers a rename or a visibility slip,
+    but it cannot answer the commonest case — `Activity::new` where no unit
+    ever wrote a constructor — because for a missing item nothing defines it
+    anywhere. That search returned None, the cluster collapsed to the CALLER
+    alone, and the repair was handed the one section that is not at fault. It
+    cannot fix the error, so the loop re-attempted the same impossible edit
+    every round: 8 of 15 recorded build failures ended within two errors of
+    compiling, several of them stuck exactly here.
+
+    So fall back to where the item BELONGS: the receiver type named in the
+    message, resolved to the section holding its inherent impl.
+    """
+    msg = err.get("message", "")
+    if not _NAME_ERR.search(msg):
         return None
-    for name in _BACKTICKED.findall(err.get("message", "")):
+    for name in _BACKTICKED.findall(msg):
         pat = re.compile(rf"\bfn\s+{re.escape(name)}\b")
         for sid, code_str in sections_code.items():
             if pat.search(code_str):
                 return sid
+    m = _RECEIVER.search(msg)
+    if m:
+        return _impl_owner(_base_type(m.group(1)), sections_code)
     return None
 
 

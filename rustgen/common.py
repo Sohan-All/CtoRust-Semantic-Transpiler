@@ -166,6 +166,7 @@ def parse_regression(old: str, new: str) -> str:
 
 _BLOCK = re.compile(r"\b(impl|trait)\b[^{;]*\{(.*?)\n\}", re.S)
 _ITEM = re.compile(r"\b(fn|const|type|struct|enum)\b")
+_FN_NAME = re.compile(r"(?:^|[\s;{}])fn\s+(\w+)", re.M)
 
 
 def _empty_blocks(code: str) -> list[str]:
@@ -208,9 +209,35 @@ def emptied_blocks(old: str, new: str) -> str:
     """
     before, after = _empty_blocks(old), _empty_blocks(new)
     if len(after) > len(before):
+        dropped = (set(_FN_NAME.findall(_blank_literals(old)))
+                   - set(_FN_NAME.findall(_blank_literals(new))))
         return (f"repair emptied {len(after) - len(before)} impl/trait "
-                f"block(s) of every item, keeping only comments")
+                f"block(s) of every item, keeping only comments"
+                + (f" (lost: {', '.join(sorted(dropped))})" if dropped else ""))
     return ""
+
+
+# A deduplication exemption was tried here and REVERTED — recorded because the
+# reasoning looked sound and was wrong twice over.
+#
+# `binary_heap base_srvB_t2` stalled with nine rejections and zero accepted
+# repairs, which read like this guard blocking the only correct fix for E0592
+# ("duplicate definitions for `compare`"). The proposed exemption: permit the
+# emptying when every dropped fn still exists elsewhere in the crate.
+#
+# Wrong on the facts. The two `compare`s were not peers — the shared-types copy
+# was `todo!()` and the unit's copy was the real implementation. The model was
+# proposing to delete the REAL one and keep the stub; the guard was right to
+# refuse. The stall's cause was upstream (stage T shipping a stubbed `impl`
+# block after exhausting its retries), not this check.
+#
+# Wrong on the mechanics too, and independently: `spawn`/`dispatch`/`peek` in
+# the base_srvB_t1 gutting all "existed elsewhere" as deps stubs, so the
+# exemption permitted a genuine gutting. Restricting it to non-stub definitions
+# then flipped the other case, because the surviving copy there WAS the stub.
+#
+# Both directions were caught only by testing against both fixtures at once.
+# Do not reintroduce this without doing the same.
 
 
 def remaining_stubs(code: str) -> str:

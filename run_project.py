@@ -200,6 +200,54 @@ async def phase_rustgen(c_root: Path, idx: ProjectIndex) -> None:
                else {})
 
     order = [f for g in idx.groups for f in g]
+
+    # Responsibility assignment, ONCE over the whole project. It used to run
+    # inside the per-file loop, where it could only ever see one file's units —
+    # so a concern two files both implement was invisible to it, and each file's
+    # pass was individually correct while the crate ended up with two
+    # definitions (E0592/E0428). Every duplicate that BUILD_FAILED `array_list`
+    # t3 crossed a file boundary this way. Same shape as the chunker's
+    # same-file-only call sites before project_call_texts().
+    #
+    # Ids are qualified `<stem>__<unit>` to match the assembled crate's MTU
+    # banners, since `exp_0001` exists in every file. Context is the shared
+    # project types: file-local types are not synthesized until the loop below
+    # (and their stage T needs the sibling registry the loop builds, so it
+    # cannot be hoisted), but a concern two files can both implement is by
+    # construction a concern about a SHARED type, which is exactly what
+    # shared_rs describes.
+    prefix_of = {f: stem_of(f).replace("-", "_") + "__" for f in order}
+    units_by_file = {}
+    for fname in order:
+        u = Store.load(files_dir(c_root) / stem_of(fname)).final_units()
+        if u:
+            units_by_file[fname] = u
+    concerns = None
+    if cfg.rustgen_spec_mode == "rich" and units_by_file:
+        prior = _latest(pdir, "responsibility")
+        if prior is not None:
+            concerns = prior.get("concerns", [])
+            print(f"[spec] responsibility: {len(concerns)} concern(s) "
+                  f"(resumed)")
+        else:
+            from rustgen.spec_stage import assign_responsibilities
+            qualified = [dc.replace(u, id=prefix_of[f] + u.id)
+                         for f, us in units_by_file.items() for u in us]
+            before = len(degraded)
+            concerns = await assign_responsibilities(
+                llm, qualified, shared_rs,
+                max_tokens=min(8000, 2000 + 80 * len(qualified)),
+                failures=degraded)
+            # Persist only a pass that actually ran. Failure returns [] just as
+            # "no shared concerns" does, and recording that would let a resume
+            # accept the failed assignment as a finished one.
+            if len(degraded) == before:
+                _record(pdir, {"type": "responsibility", "concerns": concerns})
+            cross = len({c["owner"].split("__")[0] for c in concerns})
+            print(f"[spec] responsibility: {len(concerns)} concern(s) over "
+                  f"{len(qualified)} units in {len(units_by_file)} files, "
+                  f"{cross} owning file(s)")
+
     for fname in order:
         stem = stem_of(fname)
         store = Store.load(files_dir(c_root) / stem)
@@ -218,7 +266,8 @@ async def phase_rustgen(c_root: Path, idx: ProjectIndex) -> None:
             file_types, glossary = await synthesize_types(
                 llm, units, cfg.rustgen_types_max_tokens,
                 project_block=_project_block(shared_rs, pglossary, registry,
-                                             idx, fname))
+                                             idx, fname),
+                failures=degraded)
             store.write_record({"type": "rust_types", "types_rs": file_types,
                                 "glossary": glossary, "project": True})
 
@@ -290,6 +339,7 @@ async def phase_rustgen(c_root: Path, idx: ProjectIndex) -> None:
             fresh = await generate_specs(
                 llm, units, ctx_types, glossary, cfg, extras=extras,
                 skip=set(specs), failures=degraded,
+                concerns=concerns, id_prefix=prefix_of[fname],
                 on_result=lambda uid, spec: store.write_record(
                     {"type": "rust_spec", "unit": uid, "project": True, **spec}))
             specs.update(fresh)

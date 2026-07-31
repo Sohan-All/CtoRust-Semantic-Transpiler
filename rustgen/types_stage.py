@@ -94,10 +94,21 @@ GLOSSARY:
 
 async def synthesize_types(llm: LLM, units: list[Explanation],
                            max_tokens: int,
-                           project_block: str = "") -> tuple[str, dict]:
+                           project_block: str = "",
+                           failures: list[dict] | None = None) -> tuple[str, dict]:
     """`project_block` (multi-file translation): shared project types +
     sibling-function notice, prepended as fixed context — this file's Stage T
-    then defines ONLY file-local types and must not re-stub sibling fns."""
+    then defines ONLY file-local types and must not re-stub sibling fns.
+
+    `failures` receives a record when the stub gate exhausts its retries. That
+    outcome is not survivable in practice and used to be a printed warning the
+    run then ignored: a stubbed shared block gives every unit a phantom API to
+    defer to, and when a unit implements the method for real anyway the two
+    collide as E0592. The compile loop cannot resolve that — it deliberately
+    will not rewrite the shared block — so the only move left is deleting the
+    real implementation, which `emptied_blocks` refuses. `binary_heap
+    base_srvB_t2` stalled exactly there: nine refused repairs, zero accepted,
+    `12 -> 7 -> 7 -> 7`, and the two lines below were the only warning."""
     prompt = TYPES_PROMPT.format(units="\n\n".join(unit_block(u) for u in units))
     if project_block:
         prompt = project_block + "\n" + prompt
@@ -132,7 +143,13 @@ async def synthesize_types(llm: LLM, units: list[Explanation],
             prompt = base_prompt + "\n\n" + STUB_RETRY_NOTE.format(problem=problem)
     else:
         # exhausted: keep the last draw (the compile loop and the assembled
-        # crate's stub gate still get a say) but make it loud in the log
+        # crate's stub gate still get a say) but make it loud in the log AND
+        # in the record — a printed warning alone let a doomed run proceed to
+        # scoring as if it were ordinary
         print(f"[types] {problem} — still present after {TYPES_RETRIES} "
               f"retries; units may defer to these stubs")
+        if failures is not None:
+            failures.append({"stage": "types", "unit": "(shared types)",
+                             "error": f"stub gate exhausted after "
+                                      f"{TYPES_RETRIES} retries: {problem}"})
     return types_rs, glossary if isinstance(glossary, dict) else {}

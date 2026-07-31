@@ -25,7 +25,10 @@ whole program down. Nothing downstream fills these in: this unit is the only
 thing that implements its own signatures. Write every body now, using the
 shared types, the sibling signatures above, and Rust std. Only if a capability
 is genuinely impossible with what you have been given may a stub remain, and
-then it MUST carry the reason: `todo!("<why>")`."""
+then its message MUST be a full sentence naming what is missing and why — e.g.
+`todo!("no sibling provides tag storage and Task has no field for it")`. A
+placeholder, or a bare function name in angle brackets, is not an
+explanation."""
 
 PARSE_RETRY_NOTE = """\
 Your previous reply did not parse: {problem}. Emit the COMPLETE section with
@@ -34,15 +37,15 @@ every block closed."""
 CODE_PROMPT = """\
 Implement ONE behavioral unit of a program in safe, idiomatic Rust.
 
-Rules:
+The rules below come in three parts. Part 1 always applies. Part 2 settles
+which rule wins when two of them could apply. Part 3 is a list of conditions —
+check each against this unit, and apply only the ones whose IF matches.
+
+=== PART 1: ALWAYS ===
+
 - Implement exactly the signature(s) given for this unit — no changes to them.
 - Use only: the shared types below, the sibling signatures below (call them
   freely; their bodies exist elsewhere), `deps::` stubs, and Rust std.
-- Functions listed under "SIBLING MODULE FUNCTIONS" in the shared-types
-  context (multi-file projects) are implemented elsewhere in this same crate:
-  call them directly by name, never re-implement or stub them.
-- If the shared types begin with an `// API CONTRACT` comment block, its
-  conventions are binding for this unit's code.
 - Do NOT redefine shared types, sibling functions, or deps stubs. Private
   helpers are allowed: nest a single-use helper as a `fn` inside its caller;
   a module-level helper gets a short descriptive snake_case name. Never embed
@@ -50,52 +53,8 @@ Rules:
 - Visibility: `pub(crate)` on every item (fn, struct, trait, impl-block
   methods, const). Only the program's designated entry point and
   `#[no_mangle]` FFI exports are `pub`.
-- Idiom specifics: `match` (never `if`/`else if` chains) for string->variant
-  and variant->value dispatch; `&'static str` (not `String`) from fixed-text
-  lookups like name/label functions; `writeln!`/`println!` instead of
-  `write!`/`print!` with a trailing `\\n` — see the TRAILING NEWLINE rule, the
-  `\\n` must come OUT of the format string when you switch; propagate errors
-  with `?` — never
-  `.map_err(|_| ...)` that throws away the underlying error unless the
-  contract pins a specific variant; infallible operations return the value
-  directly, never a Result that can only be Ok.
-- TRAILING NEWLINE — exactly one newline total, counted, not guessed. The
-  `ln` in `println!`/`eprintln!`/`writeln!` appends a newline of its own, so
-  `println!("done\\n")` emits TWO and every byte-comparison against the C
-  fails. When mirroring a C `printf`/`fprintf`, count the trailing `\\n` in
-  C's format string and keep the total the same:
-    C ends with one `\\n`  -> `println!` with the `\\n` REMOVED (or `print!`
-                             keeping it — pick one, never both)
-    C ends with no `\\n`   -> `print!` / `eprint!`
-    C ends with two `\\n`  -> `println!` with ONE `\\n` left in the string
-  C `puts(s)` appends its own newline -> `println!("{{}}", s)`. This applies
-  to every line of a multi-line banner or usage text: reproduce the interior
-  newlines exactly and add none at the end. Same stream as the C —
-  `fprintf(stderr, ...)` -> `eprint!`/`eprintln!`, `printf` -> stdout.
-- EXIT STATUS IS OBSERVABLE: when this unit's C returns a value that becomes
-  the process exit status, the specific numbers are output. If the C can
-  produce more than one non-zero code (`return 1` here, `return 2` there),
-  every one must survive to the entry point — an `Err(_) => 1` catch-all that
-  reports 2 as 1 is a behavior change no compiler will flag. Honor whatever
-  the spec's signature and error_mapping chose for carrying the code.
-- API-SHAPE FIREWALL: C source or C-derived descriptions never dictate API
-  shape. A C comparator returning int becomes a function returning
-  `std::cmp::Ordering` (or an `Ord`/`PartialOrd` impl); a C print function
-  for a type becomes an `impl Display` (callers print with `println!("{{}}",
-  x)`); an int-as-bool predicate returns `bool`; a C out-parameter becomes
-  the return value.
-- OWNERSHIP ORDER: when the C stores an object (appends it to a list,
-  installs a pointer) and then keeps mutating it through the stored pointer,
-  restructure: populate the object FULLY first, insert it LAST. Never insert
-  a `.clone()` and continue mutating the local original — the stored copy
-  silently misses every later mutation.
-- ARGV: an `args: &[String]` parameter mirrors C argv — args[0] is the
-  program path; subcommands and flags start at args[1]. Never match a
-  command against args[0] (or `args.first()`/`args.get(0)`).
-- Every invariant listed for the unit MUST be honored, EXCEPT where it merely
-  restates C's in-memory representation (see the REPRESENTATION vs BEHAVIOR
-  rule above, which wins). Invariants are acceptance criteria, not a comment
-  checklist. Cite an invariant in a
+- Every invariant listed for the unit MUST be honored — invariants are
+  acceptance criteria, not a comment checklist. Cite an invariant in a
   `// invariant:` comment ONLY where the code would look wrong or arbitrary
   without it. If an invariant is satisfied structurally by Rust itself
   (ownership/RAII handles a free, a `Vec` bounds-checks, a type makes a state
@@ -107,35 +66,139 @@ Rules:
   about the spec, the siblings, these instructions, design alternatives, or
   your reasoning — if you must explain a decision, do it OUTSIDE the code
   block.
-- REPRESENTATION vs BEHAVIOR — this OVERRIDES the invariant rule below. C's
-  in-memory representation is not observable behavior, and an invariant that
-  describes one states how C stored the data, not what the program does. A
-  Rust `String`/`Vec` carries its own length, so a terminator is never needed
-  and a literal 0 byte inside one is a BUG that shows up in the program's
-  output. Never write `.push('\\0')`, `\\0` in a string literal, or reserve
-  "+1 for the terminator".
-    "must be terminated by a zero byte"   -> just build the String; drop it
-    C `*end = '\\0'` (truncate in place)   -> `s.truncate(n)` / `&s[..n]`
-    C `strlen(buf)`                       -> `s.len()` (do NOT add or subtract 1)
-    C `char buf[N]` + manual copies        -> `String`/`Vec<u8>`, no capacity
-                                             bookkeeping
-  Satisfy such an invariant by producing the same OBSERVABLE bytes — the same
-  printed text, the same length reported to the user — never by reproducing
-  C's storage trick. The single exception is a genuine external wire format
-  (a file or socket the program reads/writes, where a real reader depends on
-  the byte layout); reproduce that byte-for-byte, and only that.
-- Where other C idioms were described (manual buffers, index bookkeeping),
-  likewise implement the behavior with Rust collections.
-- If some part is genuinely unimplementable from the information given, write
-  `todo!("<what is missing>")` for that part only.
-- ALLOCATOR OWNERSHIP: Rust collections (Vec/String/Box) own their buffers —
-  NEVER pass a collection's buffer to an allocator function (malloc/realloc/
-  free, `*alloc*`-style deps, `Vec::from_raw_parts` over such a pointer):
-  that mixes allocators and corrupts memory. Growth/shrink/copy of a
-  collection uses its own methods (push/insert/reserve/truncate/clone).
-  Descriptions of C realloc/capacity machinery are C idioms — implement the
-  *behavior* with collection methods; capacity invariants may be tracked as
-  plain numbers if the contract needs them.
+- If some part is genuinely unimplementable from the information given,
+  replace only that part with a `todo!` whose message is a full sentence
+  naming what is missing and why — e.g. `todo!("no sibling provides tag
+  storage and Task has no field for it")`. A placeholder, or a bare function
+  name in angle brackets, is not an explanation.
+
+=== PART 2: PRECEDENCE ===
+
+When two rules could apply to the same code, the earlier one wins:
+
+  1. ORPHAN RULE — a violation does not compile, so nothing else can matter.
+  2. REPRESENTATION vs BEHAVIOR — decides which invariants are real behavior.
+     It OVERRIDES "every invariant MUST be honored" in Part 1: an invariant
+     that merely restates C's in-memory representation is NOT honored by
+     reproducing that representation.
+  3. Everything else.
+
+=== PART 3: CONDITIONAL RULES ===
+
+Three of these are marked OBSERVABLE. A mistake there changes what the program
+prints or returns, and no compiler will flag it.
+
+--- IF the shared-types context lists "SIBLING MODULE FUNCTIONS"
+    THEN those functions are implemented elsewhere in this same crate: call
+    them directly by name, never re-implement or stub them.
+
+--- IF the shared types begin with an `// API CONTRACT` comment block
+    THEN its conventions are binding for this unit's code.
+
+--- IF an invariant describes how C stored the data in memory
+    THEN [OBSERVABLE] REPRESENTATION vs BEHAVIOR applies. C's in-memory
+    representation is not observable behavior. A Rust `String`/`Vec` carries
+    its own length, so a terminator is never needed and a literal 0 byte
+    inside one is a BUG that shows up in the program's output. Never write
+    `.push('\\0')`, `\\0` in a string literal, or reserve "+1 for the
+    terminator".
+      "must be terminated by a zero byte"   -> just build the String; drop it
+      C `*end = '\\0'` (truncate in place)   -> `s.truncate(n)` / `&s[..n]`
+      C `strlen(buf)`                       -> `s.len()` (do NOT add or subtract 1)
+      C `char buf[N]` + manual copies        -> `String`/`Vec<u8>`, no capacity
+                                               bookkeeping
+    The same applies to how C arranged its COLLECTIONS, and there the mistake
+    is louder: when C keeps two views of the same elements (a heap array and a
+    linear list, a list plus a count, a map plus a parallel index) the shared
+    types here have usually collapsed them into ONE Rust collection. An
+    invariant like "must be present in both the queue and the task list" then
+    describes C's bookkeeping, not behavior — it is satisfied by a single
+    insert into the one collection that exists. Inserting twice to satisfy it
+    literally duplicates every element and every count the program prints.
+    Before writing a second insert, remove or push, check the shared types for
+    whether the two containers the invariant names are actually one field.
+    Satisfy such an invariant by producing the same OBSERVABLE bytes — the
+    same printed text, the same counts and lengths reported to the user —
+    never by reproducing C's storage arrangement. The single exception is a
+    genuine external wire format (a file or socket the program reads/writes,
+    where a real reader depends on the byte layout); reproduce that
+    byte-for-byte, and only that.
+
+--- IF this unit mirrors a C `printf`/`fprintf`/`puts`
+    THEN [OBSERVABLE] TRAILING NEWLINE applies — exactly one newline total,
+    counted, not guessed. The `ln` in `println!`/`eprintln!`/`writeln!`
+    appends a newline of its own, so `println!("done\\n")` emits TWO and every
+    byte-comparison against the C fails. Count the trailing `\\n` in C's
+    format string and keep the total the same:
+      C ends with one `\\n`  -> `println!` with the `\\n` REMOVED (or `print!`
+                               keeping it — pick one, never both)
+      C ends with no `\\n`   -> `print!` / `eprint!`
+      C ends with two `\\n`  -> `println!` with ONE `\\n` left in the string
+    C `puts(s)` appends its own newline -> `println!("{{}}", s)`. This applies
+    to every line of a multi-line banner or usage text: reproduce the interior
+    newlines exactly and add none at the end. Same stream as the C —
+    `fprintf(stderr, ...)` -> `eprint!`/`eprintln!`, `printf` -> stdout.
+
+--- IF this unit's C returns a value that becomes the process exit status
+    THEN [OBSERVABLE] the specific numbers are output. If the C can produce
+    more than one non-zero code (`return 1` here, `return 2` there), every one
+    must survive to the entry point — an `Err(_) => 1` catch-all that reports
+    2 as 1 is a behavior change no compiler will flag. Honor whatever the
+    spec's signature and error_mapping chose for carrying the code.
+
+--- IF the spec asks for a trait impl
+    THEN ORPHAN RULE applies: a trait impl is only possible when this crate
+    owns the trait or the type. `impl FromStr for i32`,
+    `impl Display for String`, `impl Ord for u32` do not compile — no body, no
+    workaround, and one of them fails the whole crate. For a trait impl on a
+    primitive or another std type, write a plain function instead
+    (`parse_priority(s: &str) -> Result<i32, E>`) and implement nothing else.
+    Never emit such an `impl` with a `todo!()` inside "explaining" that it is
+    impossible — delete the block.
+
+--- IF the C stores an object (appends it to a list, installs a pointer) and
+    then keeps mutating it through the stored pointer
+    THEN OWNERSHIP ORDER applies: populate the object FULLY first, insert it
+    LAST. Never insert a `.clone()` and continue mutating the local original —
+    the stored copy silently misses every later mutation.
+
+--- IF this unit takes an `args: &[String]` parameter
+    THEN it mirrors C argv — args[0] is the program path; subcommands and
+    flags start at args[1]. Never match a command against args[0] (or
+    `args.first()`/`args.get(0)`).
+
+--- IF the C source or a C-derived description suggests an API shape
+    THEN the API-SHAPE FIREWALL applies: it never dictates API shape. A C
+    comparator returning int becomes a function returning `std::cmp::Ordering`
+    (or an `Ord`/`PartialOrd` impl); a C print function for a type becomes an
+    `impl Display` (callers print with `println!("{{}}", x)`); an int-as-bool
+    predicate returns `bool`; a C out-parameter becomes the return value.
+
+--- IF the unit describes other C idioms (manual buffers, index bookkeeping)
+    THEN likewise implement the behavior with Rust collections.
+
+--- IF allocator functions are in play (malloc/realloc/free, `*alloc*`-style
+    deps, `Vec::from_raw_parts`)
+    THEN ALLOCATOR OWNERSHIP applies: Rust collections (Vec/String/Box) own
+    their buffers — NEVER pass a collection's buffer to an allocator function;
+    that mixes allocators and corrupts memory. Growth/shrink/copy of a
+    collection uses its own methods (push/insert/reserve/truncate/clone).
+    Descriptions of C realloc/capacity machinery are C idioms — implement the
+    *behavior* with collection methods; capacity invariants may be tracked as
+    plain numbers if the contract needs them.
+
+--- IF this unit dispatches string->variant or variant->value
+    THEN use `match`, never `if`/`else if` chains.
+
+--- IF this unit returns fixed text (a name/label lookup)
+    THEN return `&'static str`, not `String`.
+
+--- IF this unit can fail
+    THEN propagate errors with `?` — never `.map_err(|_| ...)` that throws
+    away the underlying error unless the contract pins a specific variant.
+
+--- IF an operation cannot fail
+    THEN return the value directly, never a Result that can only be Ok.
 
 SHARED TYPES:
 ```rust
