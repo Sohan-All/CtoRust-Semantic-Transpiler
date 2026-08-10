@@ -25,11 +25,11 @@ DEPRECATED_CONFIG_KEYS = {
 MODEL_SERVERS = {
     "gemma-4-26b-a4b": {
         "base_url": "http://127.0.0.1:8000/v1",
-        "api_key_file": "/nobackup2/alleshwaram/gemma4-vllm/api_key.txt",
+        "api_key_file": "/nobackup2/alleshwaram/CtoRust/gemma4-vllm/api_key.txt",
     },
     "gemma-4-31b": {
         "base_url": "http://127.0.0.1:8001/v1",
-        "api_key_file": "/nobackup2/alleshwaram/gemma4-31b-vllm/api_key.txt",
+        "api_key_file": "/nobackup2/alleshwaram/CtoRust/gemma4-31b-vllm/api_key.txt",
     },
     # Second instance of the SAME weights, tensor-parallel over the other two
     # GPUs. Two servers rather than two runs sharing one: vLLM interleaves
@@ -38,7 +38,7 @@ MODEL_SERVERS = {
     # being measured is run-to-run variance.
     "gemma-4-31b-b": {
         "base_url": "http://127.0.0.1:8002/v1",
-        "api_key_file": "/nobackup2/alleshwaram/gemma4-31b-b-vllm/api_key.txt",
+        "api_key_file": "/nobackup2/alleshwaram/CtoRust/gemma4-31b-b-vllm/api_key.txt",
     },
     # Anthropic models via Google Vertex AI. NOT a vLLM server — `backend`
     # switches llm.py onto the Anthropic SDK, and base_url/api_key_file do not

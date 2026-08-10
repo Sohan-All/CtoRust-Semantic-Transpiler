@@ -283,12 +283,15 @@ def test_entry_rate_on_recorded_stage_t_output() -> None:
     every block would be a new failure mode, not a fix.
     """
     import json
-    pat = ("/nobackup2/alleshwaram/mtu_runs/abl2/runs/*/_project_*/"
-           "files/*/state.jsonl")
+    # Tag is derived RELATIVE to the runs root — see the note in
+    # test_stub_repair.py. A hardcoded index breaks silently when this tree
+    # moves, and reads as a corpus problem rather than a path problem.
+    runs = "/nobackup2/alleshwaram/CtoRust/mtu_runs/abl2/runs"
+    pat = f"{runs}/*/_project_*/files/*/state.jsonl"
     clean = fires = 0
     fired_runs = set()
     for sf in glob.glob(pat):
-        tag = sf.split("/")[6]
+        tag = sf[len(runs) + 1:].split("/")[0]
         for line in open(sf, errors="ignore"):
             try:
                 r = json.loads(line)

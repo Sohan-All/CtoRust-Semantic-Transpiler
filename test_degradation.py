@@ -373,8 +373,13 @@ def test_empty_choices() -> None:
         check("persistent empty choices raises a described error, not IndexError",
               False, "IndexError")
     except RuntimeError as e:
+        # The point is that it is DESCRIBED, not that it is worded a
+        # particular way — the bug this guards was a bare IndexError, which
+        # the except-clause above catches. Coupled to llm.py's raise site
+        # (search "no usable content"); it was previously "no choices", and
+        # the reword left this assertion failing for no behavioural reason.
         check("persistent empty choices raises a described error",
-              "no choices" in str(e), str(e))
+              "no usable content" in str(e) and "retries" in str(e), str(e))
 
 
 def test_bad_request_still_raises() -> None:
@@ -488,7 +493,7 @@ def test_parse_regression_on_real_trial4() -> None:
     from pathlib import Path
     from rustgen.common import parse_regression
 
-    state = Path("/nobackup2/alleshwaram/mtu_runs/abl2/runs/"
+    state = Path("/nobackup2/alleshwaram/CtoRust/mtu_runs/abl2/runs/"
                  "double_linked_list_base_srvA_t4/_project_B03_organic/"
                  "files/editor/state.jsonl")
     if not state.exists():
@@ -616,7 +621,7 @@ def test_emptied_blocks_on_real_fixture() -> None:
     from pathlib import Path
     from rustgen.common import emptied_blocks
 
-    state = Path("/nobackup2/alleshwaram/mtu_runs/abl2/runs/"
+    state = Path("/nobackup2/alleshwaram/CtoRust/mtu_runs/abl2/runs/"
                  "binary_heap_base_srvB_t1/_project_B03_organic/"
                  "files/scheduler/state.jsonl")
     if not state.exists():
@@ -667,7 +672,7 @@ def test_remaining_stubs_on_real_crates() -> None:
     from pathlib import Path
     from rustgen.common import remaining_stubs
 
-    runs = Path("/nobackup2/alleshwaram/mtu_runs/abl2/runs")
+    runs = Path("/nobackup2/alleshwaram/CtoRust/mtu_runs/abl2/runs")
     if not runs.exists():
         print("  SKIP  runs not on disk")
         return
@@ -763,7 +768,7 @@ def test_emptied_blocks_both_fixtures() -> None:
     from pathlib import Path
     from rustgen.common import emptied_blocks
 
-    runs = Path("/nobackup2/alleshwaram/mtu_runs/abl2/runs")
+    runs = Path("/nobackup2/alleshwaram/CtoRust/mtu_runs/abl2/runs")
     if not runs.exists():
         print("  SKIP  runs not on disk")
         return
@@ -849,6 +854,7 @@ def test_one_call_is_bounded() -> None:
     """
     print("\n=== transport: one logical call is bounded and reports ===")
     import dataclasses
+    import os
     import openai
     import llm as llm_mod
     from config import Config
@@ -900,12 +906,17 @@ def test_one_call_is_bounded() -> None:
 
     cfg2 = dataclasses.replace(Config(), call_deadline=1, retry_backoff=0.01,
                                transport_retries=2)
-    obj = llm_mod.LLM.__new__(llm_mod.LLM)
-    obj.cfg = cfg2
+    # Build through the REAL __init__ and swap only the transport, exactly as
+    # _llm() does. Hand-listing attributes after LLM.__new__ silently rots the
+    # moment __init__ grows one: `backend` was added for the anthropic-vertex
+    # path and this test began dying on AttributeError inside ask(), which
+    # also zeroed the retry counter and made the NEXT check fail for a reason
+    # that had nothing to do with retries.
+    os.environ["VLLM_BASE_URL"] = "http://127.0.0.1:1/v1"
+    os.environ["VLLM_API_KEY"] = "x"
+    obj = llm_mod.LLM(cfg2)
     obj.client = _AlwaysTimeout()
     obj.sem = asyncio.Semaphore(1)
-    obj.calls = obj.input_tokens = obj.output_tokens = 0
-    obj.transport_retries = 0
     try:
         asyncio.run(obj.ask("hi", max_tokens=512))
         check("a call that never succeeds raises", False, "returned normally")
@@ -1015,7 +1026,7 @@ def test_illegal_type_bodies() -> None:
     # because a checker that fires on a third of all types blocks is noise.
     import json, glob
     flagged = total = 0
-    for f in glob.glob("/nobackup2/alleshwaram/mtu_runs/abl2/runs/*/"
+    for f in glob.glob("/nobackup2/alleshwaram/CtoRust/mtu_runs/abl2/runs/*/"
                        "_project_B03_organic/files/*/state.jsonl"):
         for line in open(f):
             try:
@@ -1036,7 +1047,7 @@ def test_illegal_type_bodies() -> None:
     # shared REPAIR, which is why gating stage T alone would not have caught
     # it and set_section carries the same check.
     recs = [json.loads(l) for l in open(
-        "/nobackup2/alleshwaram/mtu_runs/abl2/runs/binary_heap_base_srvA_t5/"
+        "/nobackup2/alleshwaram/CtoRust/mtu_runs/abl2/runs/binary_heap_base_srvA_t5/"
         "_project_B03_organic/project.jsonl")]
     pt = [r for r in recs if r.get("type") == "project_types_all"]
     if len(pt) >= 2:

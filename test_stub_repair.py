@@ -358,12 +358,16 @@ def test_llm_that_raises_does_not_kill_the_run() -> None:
 def test_finds_the_stubs_in_the_recorded_crates() -> None:
     """Known-good/known-bad against real data: the loop must find stubs in the
     crates the gate voided, and find none in the crates that scored."""
-    pat = ("/nobackup2/alleshwaram/mtu_runs/abl2/runs/*/_project_*/"
-           "rust_crate/src/lib.rs")
+    # Derive the tag RELATIVE to the runs root. A hardcoded f.split("/")[6]
+    # silently returned "runs" when this tree moved under CtoRust/, so every
+    # verdict lookup missed and the test passed 0 crates through both arms
+    # while still reporting a failure that read like a corpus problem.
+    runs = "/nobackup2/alleshwaram/CtoRust/mtu_runs/abl2/runs"
+    pat = f"{runs}/*/_project_*/rust_crate/src/lib.rs"
     voided = clean = 0
     for f in glob.glob(pat):
-        tag = f.split("/")[6]
-        vf = f"/nobackup2/alleshwaram/mtu_runs/abl2/score/{tag}.verdict"
+        tag = f[len(runs) + 1:].split("/")[0]
+        vf = f"/nobackup2/alleshwaram/CtoRust/mtu_runs/abl2/score/{tag}.verdict"
         try:
             verdict = open(vf).read()
         except OSError:

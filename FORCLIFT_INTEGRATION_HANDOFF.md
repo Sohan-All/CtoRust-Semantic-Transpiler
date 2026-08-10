@@ -11,8 +11,8 @@ Nothing in `forclift/` references diffusionMTUs yet. (A *different* branch had a
 prior art, but that's the older c2rust PhaseFn world, **not** the forclift v2 target
 here.)
 
-Paths below are relative to `/nobackup2/alleshwaram/uwisc-docker/` unless noted.
-The pipeline itself lives at `/nobackup2/alleshwaram/diffusionMTUs/`.
+Paths below are relative to `/nobackup2/alleshwaram/CtoRust/uwisc-docker/` unless noted.
+The pipeline itself lives at `/nobackup2/alleshwaram/CtoRust/diffusionMTUs/`.
 
 ---
 

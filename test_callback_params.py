@@ -19,7 +19,7 @@ from pathlib import Path
 
 from chunker import chunk, fn_pointer_typedefs, _callback_params
 
-CORPUS = Path("/nobackup2/alleshwaram/Test-Corpus/Public-Tests/B03_organic")
+CORPUS = Path("/nobackup2/alleshwaram/CtoRust/Test-Corpus/Public-Tests/B03_organic")
 
 _failures: list[str] = []
 

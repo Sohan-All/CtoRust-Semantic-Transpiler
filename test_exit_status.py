@@ -17,7 +17,7 @@ import sys
 from exit_status import analyze_project, interesting
 
 CORPUS = pathlib.Path(
-    "/nobackup2/alleshwaram/Test-Corpus/Public-Tests/B03_organic")
+    "/nobackup2/alleshwaram/CtoRust/Test-Corpus/Public-Tests/B03_organic")
 
 _failures: list[str] = []
 
