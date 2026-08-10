@@ -397,6 +397,277 @@ def illegal_stubs(code: str) -> str:
     return f"{len(hits)} unexplained stub body/bodies: {shown}"
 
 
+# A derived trait replaces the hand-written method of the same name, so losing
+# it is legitimate. This is the exemption that sank the earlier "lost a fn"
+# rule, which fired on every such substitution.
+_IMPL_HEADER = re.compile(
+    r"\bimpl(?:<[^>]*>)?\s+(?:(?P<trait>[\w:]+(?:<[^>]*>)?)\s+for\s+)?"
+    r"(?P<ty>[\w:]+)(?:<[^>]*>)?\s*\{")
+# The one exception both stage-T prompts explicitly REQUIRE: the error enum's
+# hand-written Display and Error impls. Those carry real bodies by design.
+_ALLOWED_TRAIT_BODIES = {"Display", "Error", "fmt::Display", "std::fmt::Display",
+                         "error::Error", "std::error::Error"}
+
+
+_DERIVE_METHODS = {
+    "Ord": {"cmp"}, "PartialOrd": {"partial_cmp"}, "PartialEq": {"eq", "ne"},
+    "Eq": set(), "Default": {"default"}, "Clone": {"clone", "clone_from"},
+    "Debug": {"fmt"}, "Hash": {"hash"}, "Copy": set(),
+}
+
+
+def _impl_method_names(code: str) -> set[str]:
+    """`fn` names defined inside an `impl` block. Free functions are excluded:
+    a repair legitimately inlines or renames a private helper, and counting
+    those is what made the earlier rule too noisy to use."""
+    blanked = _blank_literals(code)
+    names: set[str] = set()
+    for m in _IMPL_HEADER.finditer(blanked):
+        depth, k, n = 0, m.end() - 1, len(blanked)
+        while k < n:
+            if blanked[k] == "{":
+                depth += 1
+            elif blanked[k] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            k += 1
+        names.update(re.findall(r"\bfn\s+(\w+)", blanked[m.end():k]))
+    return names
+
+
+def lost_impl_methods(old: str, new: str, elsewhere: str = "") -> str:
+    """"" if the repair kept every impl method, else a description.
+
+    `emptied_blocks` only catches a block emptied of EVERY item, so partial
+    gutting walks straight through it — and partial gutting is what actually
+    breaks runs. `array_list base_srvB_t6` is the case: a repair returned
+    `impl Project` with `completion_percent`, `total_points`, `open_points`
+    and `fmt` intact and `new` silently dropped, and the same for `impl Task`,
+    keeping seven of eight. Braces balanced, block non-empty, guard silent —
+    then every caller failed E0599 and the crate never built.
+
+    Two exemptions keep this usable, both learned from the rule's earlier
+    rejected form:
+
+      - a name still defined ELSEWHERE in the crate is a move or a
+        deduplication, not a loss. `*_deps` stubs do NOT count as a definition
+        — that hole is exactly why "lost a fn defined nowhere else" was
+        discarded the first time;
+      - a `#[derive(Trait)]` the new code adds legitimately replaces that
+        trait's hand-written method.
+    """
+    lost = _impl_method_names(old) - set(re.findall(r"\bfn\s+(\w+)",
+                                                    _blank_literals(new)))
+    if not lost:
+        return ""
+    # names still defined outside any *_deps module elsewhere in the crate
+    survivors: set[str] = set()
+    if elsewhere:
+        blanked = _blank_literals(elsewhere)
+        spans = []
+        for m in _DEPS_MOD.finditer(blanked):
+            depth, k, n = 0, m.end() - 1, len(blanked)
+            while k < n:
+                if blanked[k] == "{":
+                    depth += 1
+                elif blanked[k] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                k += 1
+            spans.append((m.start(), k))
+        for m in re.finditer(r"\bfn\s+(\w+)", blanked):
+            if not any(a <= m.start() <= b for a, b in spans):
+                survivors.add(m.group(1))
+    derived: set[str] = set()
+    for m in re.finditer(r"#\[derive\(([^)]*)\)\]", new):
+        for t in (x.strip() for x in m.group(1).split(",")):
+            derived |= _DERIVE_METHODS.get(t.split("::")[-1], set())
+    candidates = lost - survivors - derived
+    if not candidates:
+        return ""
+    # Deleting a method NOTHING calls is dead-code removal, and a repair is
+    # entitled to do it. Only a method with live callers is damage. Without
+    # this the rule fires on 4.6% of transitions in runs that went on to build
+    # cleanly — indistinguishable from the 7.5% in runs that failed, which is
+    # exactly how the earlier "lost a fn" formulations were rejected.
+    if not elsewhere:
+        return ""
+    called = _blank_literals(elsewhere)
+    real = sorted(n for n in candidates
+                  if re.search(rf"(?:\.|::)\s*{re.escape(n)}\s*[(:<]", called))
+    if not real:
+        return ""
+    return (f"repair deleted {len(real)} impl method(s) that other sections "
+            f"still call: " + ", ".join(real[:6]) + (" ..." if len(real) > 6 else ""))
+
+
+def illegal_type_bodies(code: str) -> str:
+    """"" if the types block implements no unit behaviour, else a description.
+
+    Stage T is told "types and stubs only" and "no methods (impls come later,
+    per module)". Nothing enforced it. `illegal_stubs` is not that check: it
+    only catches `todo!()` bodies, so an impl block holding a REAL method body
+    passed every gate in the pipeline.
+
+    That is not hypothetical. `binary_heap base_srvA_t5` had stage T emit
+
+        impl Scheduler { pub fn spawn(&mut self, task: SchedTask) -> ... {
+            self.tasks.push(task); Ok(())
+        } }
+
+    while the scheduler unit wrote the real four-argument `spawn`. Rust rejects
+    two inherent methods of one name regardless of signature (E0592), the
+    compile loop's only move is deleting one, and `emptied_blocks` correctly
+    refuses because that impl block holds nothing else. Six refused repairs,
+    `11 -> 7 -> 3 -> 5 -> 5 -> 5`, BUILD_FAILED. Catching it at the writer
+    removes the dilemma instead of arguing about the guard.
+
+    Permitted, and NOT reported: anything inside a `*_deps` module (stage T is
+    told to stub external domain functions there), a `todo!()` body of any
+    shape (that is `illegal_stubs`'s business, not this one — two checks with
+    two messages beat one that conflates them), and the error enum's required
+    `impl Display`/`impl Error`.
+    """
+    blanked = _blank_literals(code)
+
+    def _block_end(start: int) -> int:
+        depth, k, n = 0, start, len(blanked)
+        while k < n:
+            if blanked[k] == "{":
+                depth += 1
+            elif blanked[k] == "}":
+                depth -= 1
+                if depth == 0:
+                    return k
+            k += 1
+        return n
+
+    deps: list[tuple[int, int]] = []
+    for m in _DEPS_MOD.finditer(blanked):
+        deps.append((m.start(), _block_end(m.end() - 1)))
+
+    hits: list[str] = []
+    for m in _IMPL_HEADER.finditer(blanked):
+        if any(a <= m.start() <= b for a, b in deps):
+            continue
+        trait = m.group("trait")
+        if trait and trait.split("::")[-1] in _ALLOWED_TRAIT_BODIES:
+            continue
+        if trait in _ALLOWED_TRAIT_BODIES:
+            continue
+        body = blanked[m.end() - 1:_block_end(m.end() - 1)]
+        for fm in re.finditer(r"\bfn\s+(\w+)[^{;]*\{", body):
+            inner = body[fm.end() - 1:]
+            depth, k = 0, 0
+            while k < len(inner):
+                if inner[k] == "{":
+                    depth += 1
+                elif inner[k] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                k += 1
+            fn_body = inner[1:k]
+            if _STUB_CALL.search(fn_body) or "todo!" in fn_body:
+                continue          # illegal_stubs owns that verdict
+            if not fn_body.strip():
+                continue          # an empty body implements nothing
+            line = blanked.count("\n", 0, m.start() + fm.start()) + 1
+            hits.append(f"{m.group('ty')}::{fm.group(1)} at line {line}")
+    if not hits:
+        return ""
+    shown = ", ".join(hits[:6]) + (" ..." if len(hits) > 6 else "")
+    return (f"{len(hits)} implemented method body/bodies in the types block "
+            f"(types and stubs only): {shown}")
+
+
+def stubbed_callbacks(code: str, callback_names: set[str] | frozenset[str]) -> str:
+    """A `*_deps` stub for something that is a CALLBACK PARAMETER in the C.
+
+    Why a gate and not just a prompt rule. The prompt rules are advisory at
+    temperature 1.0 — the EXIT STATUS block landed in 4 of 8 arms — and this
+    particular mistake does not stay an honest stub. `sibling_deps` walks every
+    `*_deps` stub and asks the model to write a body from the project registry;
+    for `cc_array`'s `cp` it produced `Ok(item.clone())`, which is type-correct,
+    compiles, is flagged by nothing, and reaches a SCORED crate as a silently
+    wrong translation. A stub that panics is recoverable; an invented callback
+    is not. So the shape is refused at the point it is written.
+
+    A callback parameter has no single implementation by construction — every
+    caller passes a different one — so unlike the other `_deps` stubs there is
+    nothing for a later stage to resolve it to.
+
+    `callback_names` comes from `chunker.callback_params` over the file's C.
+    Empty set = nothing to check, which is the common case: only 17 of the 28
+    corpus projects declare a function-pointer parameter at all.
+    """
+    if not callback_names:
+        return ""
+    blanked = _blank_literals(code)
+
+    def _block_end(start: int) -> int:
+        depth, k, n = 0, start, len(blanked)
+        while k < n:
+            if blanked[k] == "{":
+                depth += 1
+            elif blanked[k] == "}":
+                depth -= 1
+                if depth == 0:
+                    return k
+            k += 1
+        return n
+
+    hits: list[str] = []
+    for m in _DEPS_MOD.finditer(blanked):
+        end = _block_end(m.end() - 1)
+        for fm in re.finditer(r"\bpub\s+fn\s+(\w+)", blanked[m.start():end]):
+            if fm.group(1) in callback_names:
+                line = blanked.count("\n", 0, m.start() + fm.start()) + 1
+                hits.append(f"{m.group(1)}::{fm.group(1)} at line {line}")
+    if not hits:
+        return ""
+    shown = ", ".join(sorted(set(hits))[:6]) + (" ..." if len(hits) > 6 else "")
+    return (f"{len(hits)} deps stub(s) for a CALLBACK the caller supplies — "
+            f"these are parameters, not external functions, and nothing can "
+            f"ever fill them: {shown}")
+
+
+_TYPE_DEF = re.compile(r"\b(?:pub(?:\([^)]*\))?\s+)?"
+                       r"(struct|enum|union|trait|type)\s+(\w+)")
+
+
+def lost_type_definitions(old: str, new: str) -> str:
+    """"" if `new` still defines every type `old` did, else a description.
+
+    The asymmetric guard a types-block REPAIR needs, and deliberately not a
+    symmetric one. The repair's whole job is usually to DELETE something — a
+    stubbed `impl` block that invents a phantom API is fixed by removing it,
+    not by filling it in — so a rule of "nothing may disappear" would forbid
+    the correct fix. What must never disappear is a type DEFINITION: every
+    unit is generated against this vocabulary, and a struct that vanishes here
+    takes every reference to it down with it.
+
+    So: methods may go, types may not. Same shape as `parse_regression` and
+    `lost_impl_methods` — judge the transition, not the end state, because the
+    block being repaired is by definition already broken and a check on the end
+    state alone would refuse to let it be touched.
+
+    Only the NAME is compared. A struct that keeps its name and gains or loses
+    a field is a redesign, which is stage T's prerogative; a struct that is
+    gone is a break. Type names inside comments and strings do not count, which
+    is why both sides are blanked first.
+    """
+    olds = {m.group(2) for m in _TYPE_DEF.finditer(_blank_literals(old))}
+    news = {m.group(2) for m in _TYPE_DEF.finditer(_blank_literals(new))}
+    gone = sorted(olds - news)
+    if not gone:
+        return ""
+    shown = ", ".join(gone[:6]) + (" ..." if len(gone) > 6 else "")
+    return (f"{len(gone)} type definition(s) dropped by the repair: {shown}")
+
+
 def extract_rust(text: str) -> str:
     """Pull Rust source out of a model reply (```rust fence, or the whole
     reply if unfenced). When the model emits several fences (draft + revised
@@ -557,7 +828,9 @@ def unit_extras(units: list[Explanation], source: str, split_over: int,
                 external_call_texts: dict[str, list[str]] | None = None,
                 exit_status: dict | None = None,
                 call_sites: bool = True, symbol_map: bool = True,
-                output_formats: bool = True) -> dict[str, str]:
+                output_formats: bool = True,
+                callback_params: bool = True,
+                fn_ptr_types: frozenset[str] | None = None) -> dict[str, str]:
     """Per-unit prompt additions, keyed by unit id.
 
     Always: the REVERSE call graph — for each C function a unit defines,
@@ -586,11 +859,21 @@ def unit_extras(units: list[Explanation], source: str, split_over: int,
     observable output — which is exactly how a distinct exit code 2 got
     flattened to 1 while the same rule landed fine in `cli_run`.
 
-    `call_sites`/`symbol_map`/`output_formats` are ablation switches (see
-    Config); False drops that block from every unit's prompt."""
+    `callback_params` emits the CALLBACK PARAMETERS block for a C function
+    taking a function pointer. The chunker keeps those out of `calls_external`
+    (they are supplied by the CALLER, not defined elsewhere), which stops stage
+    T stubbing them in `<stem>_deps`; this block is the positive half, telling
+    the unit what to write instead. Without it the unit is merely no longer
+    told the wrong thing.
+
+    `call_sites`/`symbol_map`/`output_formats`/`callback_params` are ablation
+    switches (see Config); False drops that block from every unit's prompt."""
     from chunker import chunk
 
-    graph = chunk(source, split_over)
+    # fn_ptr_types comes from the project's HEADERS: every corpus project that
+    # declares a callback through a typedef keeps that typedef in a .h, so this
+    # file's own text cannot resolve `ArrayListCompareFunc compare_func`.
+    graph = chunk(source, split_over, fn_ptr_types=fn_ptr_types)
     lines = source.split("\n")
 
     def unit_of(start: int, end: int) -> Explanation | None:
@@ -649,6 +932,15 @@ def unit_extras(units: list[Explanation], source: str, split_over: int,
     for fn, uid in defined_in.items():
         owned.setdefault(uid, []).append(fn)
 
+    # C function -> {parameter name: its C declaration} for parameters that ARE
+    # functions. getattr for the same reason the call-graph reads above use it:
+    # a SeedBlock from an older record may predate the field.
+    cb_params: dict[str, dict[str, str]] = {}
+    for b in graph.blocks:
+        p = getattr(b, "callback_params", {}) or {}
+        if b.function and p:
+            cb_params.setdefault(b.function, {}).update(p)
+
     extras: dict[str, str] = {}
     for u in units:
         parts = []
@@ -680,6 +972,29 @@ def unit_extras(units: list[Explanation], source: str, split_over: int,
                 " body cannot recover on its own — it MUST survive as a"
                 " parameter of your Rust signature, even when it looks like an"
                 " implementation detail:\n" + sites)
+        # One block for the whole unit, not one per function: the guidance is
+        # identical every time and a unit owning several such functions would
+        # otherwise carry the same three sentences five times over.
+        cb_lines = []
+        for fn in sorted(owned.get(u.id, [])) if callback_params else []:
+            for n, t in sorted(cb_params.get(fn, {}).items()):
+                cb_lines.append(f"  - `{fn}` takes `{n}` : {t}")
+        if cb_lines:
+            parts.append(
+                "\nCALLBACK PARAMETERS — these parameters receive BEHAVIOR from"
+                " the caller, not data:\n" + "\n".join(cb_lines) +
+                "\nEach stays a parameter of your Rust function, as a generic"
+                " bounded by `Fn`/`FnMut`/`FnOnce` — the loosest bound the body"
+                " needs, which is `FnMut` if you call it more than once, as a"
+                " loop does. A C `bool (*pred)(const void *)` becomes a"
+                " `<F: FnMut(&T) -> bool>` parameter the body calls as"
+                " `pred(item)`.\nDo NOT stub it in a `_deps` module, do NOT"
+                " define it as a free function, and do NOT invent a body for"
+                " it. There is no single implementation to find — different"
+                " callers pass different behavior, which is the entire point of"
+                " the parameter. Dropping it from the signature leaves the"
+                " function uncallable as intended, and no compiler error will"
+                " flag that.")
         for fn in sorted(owned.get(u.id, [])):
             info = (exit_status or {}).get(fn)
             if not info:

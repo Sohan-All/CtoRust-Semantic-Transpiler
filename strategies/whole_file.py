@@ -117,7 +117,12 @@ class WholeFileStrategy:
 
         # deterministic chunker pass purely to annotate external dependencies
         # (calls to functions not defined in this file) per line range
-        seed_blocks = chunk(source, self.cfg.split_function_over_lines).blocks
+        # fn_ptr_typedefs keeps callback PARAMETERS out of external_deps — they
+        # are supplied by the caller, not implemented elsewhere, so handing one
+        # to stage T as an external dependency gets it stubbed in `<stem>_deps`
+        # where nothing can ever fill it. See chunker._callback_params.
+        seed_blocks = chunk(source, self.cfg.split_function_over_lines,
+                            fn_ptr_types=frozenset(self.cfg.fn_ptr_typedefs)).blocks
 
         def deps_for(start: int, end: int) -> list[str]:
             return sorted({c for b in seed_blocks

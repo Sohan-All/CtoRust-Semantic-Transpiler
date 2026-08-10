@@ -40,6 +40,28 @@ MODEL_SERVERS = {
         "base_url": "http://127.0.0.1:8002/v1",
         "api_key_file": "/nobackup2/alleshwaram/gemma4-31b-b-vllm/api_key.txt",
     },
+    # Anthropic models via Google Vertex AI. NOT a vLLM server — `backend`
+    # switches llm.py onto the Anthropic SDK, and base_url/api_key_file do not
+    # apply. Auth is GCP ADC: point GOOGLE_APPLICATION_CREDENTIALS at the
+    # service-account JSON.
+    #
+    # READ THIS BEFORE COMPARING A CLAUDE RUN TO A GEMMA ONE. The sampling
+    # regime is NOT the same and cannot be made the same: this pipeline sends
+    # temperature 1.0 / top_p 0.95 / top_k 64 (Gemma's own defaults), and
+    # Claude 5-family models REJECT non-default top_p/top_k with a 400. They
+    # are dropped for this backend, and adaptive thinking — which Gemma has no
+    # equivalent for — is on by default. So a Claude-vs-Gemma run is each model
+    # at ITS OWN defaults, not one variable changed. Say so in any write-up.
+    "claude-sonnet-5": {
+        "backend": "anthropic-vertex",
+        "project_id": "cs-trustworthy-ai-43a8",
+        "region": "global",
+    },
+    "claude-opus-5": {
+        "backend": "anthropic-vertex",
+        "project_id": "cs-trustworthy-ai-43a8",
+        "region": "global",
+    },
 }
 
 
@@ -113,6 +135,41 @@ class Config:
                                            # (loop exits early at 0 errors; 5
                                            # absorbs the richer v3 API surface)
     rustgen_repair_max_tokens: int = 4000
+    # Ablation only. False restores the behaviour that shipped between the
+    # project-scoped responsibility pass and 2026-07-31: every unit receives
+    # EVERY concern it does not own as `must_not_implement`, which on
+    # `array_list` was 17-29 entries per unit against 1.9 under the old
+    # per-file pass. `array_list` reached `final: 0` in 0 of 8 arms with the
+    # flood and 3 of 4 without it, but that is mechanism plus timing, never a
+    # measurement — this knob is what makes the paired comparison possible.
+    rustgen_scoped_prohibitions: bool = True
+    # Ablation only, like the four rustgen_* knobs above: route a missing-item
+    # error (E0599 `no method/associated function named X for T`) to the
+    # section owning `impl T`, instead of leaving the cluster as the caller
+    # alone. Suspected of causing `array_list base_srvB_t6`'s ten emptied-block
+    # rejections on owner sections; set False to measure that. Ships True.
+    rustgen_owner_routing: bool = True
+    # Ablation only. When stage T's gates exhaust their retries, repair the
+    # block instead of giving up on it. That branch is a death sentence as it
+    # stands: over 255 recorded run logs every run reaching it died (4
+    # BUILD_FAILED, 3 STUB_CRATE, none scored), because a stubbed shared block
+    # hands every unit a phantom API to defer to. False restores the previous
+    # behaviour — print, record the failure, continue with the bad block.
+    # The repair can only turn a dead run into a live one; it returns the
+    # original block on any failure. Ships True.
+    rustgen_types_repair: bool = True
+    # Ablation only. Resolve remaining `todo!()` in the finished crate rather
+    # than letting `remaining_stubs` void the run. 21 runs have been voided by
+    # that gate and 13 of them died on ONE OR TWO stubs, so the leverage is in
+    # the shape of the failures, not in the share of stubs fixed. False skips
+    # the pass entirely. Ships True.
+    rustgen_stub_repair: bool = True
+    # The CONTROL arm for the above, and the one that decides whether the loop
+    # is worth its tokens. False makes the handler answer every question with
+    # "no information available", turning the loop into a plain retry. If the
+    # two score the same, the retrieval is doing nothing and the loop should
+    # go. Ships True; only an ablation should set it False.
+    rustgen_stub_context: bool = True
     rustgen_max_errors_per_section: int = 6  # errors quoted back per repair call
     rustgen_surgical_max_errors: int = 2     # sections at/below this get tier-1 edits first
     rustgen_deps_max_tokens: int = 1500      # sibling-stub resolution (sibling_deps.py)
@@ -130,6 +187,7 @@ class Config:
     rustgen_symbol_map: bool = True       # symbol_map in stage S + its checks
     rustgen_output_formats: bool = True   # OUTPUT FORMATS block
     rustgen_exit_status: bool = True      # EXIT STATUS block (exit_status.py)
+    rustgen_callback_params: bool = True  # CALLBACK PARAMETERS block (bug class 7)
     # How much of the MTU's original C the spec/code stages may see:
     #   "off"      — description + invariants only (the MTU philosophy)
     #   "literals" — just the string/char/numeric literals from the unit's C
@@ -141,6 +199,15 @@ class Config:
     # literals/full. The MTU philosophy is about not transliterating CONTROL
     # FLOW; withholding the C's literal output text just loses data.
     rustgen_c_source_context: str = "full"
+
+    # Names typedef'd to a function-pointer type, over the whole project.
+    # DERIVED, not a setting: `run.py` fills it from the source file's
+    # directory before discovery, and `run_project.py` recomputes it for the
+    # rustgen stages. It lives here because the discovery strategies see only
+    # a source STRING and a filename, never a path, and they need it to keep
+    # `ArrayListCompareFunc compare_func` out of `external_deps`. Recorded with
+    # the rest of the config, which also documents what each run actually saw.
+    fn_ptr_typedefs: list[str] = field(default_factory=list)
 
     # --- lock check ---
     lock_regex_enabled: bool = True

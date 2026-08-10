@@ -31,6 +31,23 @@ STRATEGIES = {
 async def run_one(strategy_name: str, source: str, source_path: Path, out_root: Path,
                   cfg: Config, suffix: bool) -> None:
     stem = source_path.stem + (f".{strategy_name}" if suffix else "")
+    # Function-pointer typedefs from the whole directory, not just this file:
+    # every corpus project that declares a callback as `ArrayListCompareFunc
+    # cmp` keeps the typedef in a HEADER, so a .c file cannot resolve its own
+    # callback parameters. Without this the chunker files `compare_func` under
+    # `calls_external` -> `external_deps`, and stage T stubs it in
+    # `<stem>_deps` as a global no caller can ever supply. Set before the
+    # config record is written so the record shows what the run actually saw.
+    if not cfg.fn_ptr_typedefs:
+        from chunker import fn_pointer_typedefs
+        seen: set[str] = set()
+        for f in sorted(source_path.parent.rglob("*.h")) + \
+                 sorted(source_path.parent.rglob("*.c")):
+            try:
+                seen |= fn_pointer_typedefs(f.read_text(errors="replace"))
+            except OSError:
+                continue
+        cfg.fn_ptr_typedefs = sorted(seen)
     store = Store(out_root / stem)
     store.write_record(cfg.to_record())
     store.event("start", strategy=strategy_name, file=str(source_path))

@@ -18,10 +18,33 @@ from openai import AsyncOpenAI
 from config import Config, MODEL_SERVERS
 
 
-def _make_client(model: str, timeout: int = 900) -> AsyncOpenAI:
+def backend_of(model: str) -> str:
+    """"vllm" (the default) or "anthropic-vertex".
+
+    Kept as a function rather than a flag on Config because the model name is
+    what actually determines the wire protocol — a cfg that names a Claude
+    model and a cfg that names a Gemma one must not need a second field kept
+    in sync with the first."""
+    return (MODEL_SERVERS.get(model) or {}).get("backend", "vllm")
+
+
+def _make_client(model: str, timeout: int = 900):
     """Resolve which vLLM instance serves `model` via MODEL_SERVERS, unless
     VLLM_BASE_URL/VLLM_API_KEY are set — those still win, for one-off manual
-    overrides."""
+    overrides. A model whose entry declares an `anthropic-vertex` backend gets
+    an Anthropic client instead; auth there is GCP ADC, so there is no api key
+    to read and the env overrides do not apply."""
+    if backend_of(model) == "anthropic-vertex":
+        from anthropic import AsyncAnthropicVertex
+        server = MODEL_SERVERS[model]
+        if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
+            raise SystemExit(
+                "GOOGLE_APPLICATION_CREDENTIALS is not set — the Vertex "
+                "backend authenticates with a GCP service-account JSON, not "
+                "an API key. Point it at the credentials file.")
+        return AsyncAnthropicVertex(project_id=server["project_id"],
+                                    region=server["region"],
+                                    timeout=timeout, max_retries=0)
     base_url = os.environ.get("VLLM_BASE_URL")
     api_key = os.environ.get("VLLM_API_KEY")
     if not base_url or not api_key:
@@ -57,6 +80,13 @@ def _make_client(model: str, timeout: int = 900) -> AsyncOpenAI:
                        timeout=timeout, max_retries=0)
 
 
+# Headroom added to every Anthropic request so adaptive thinking does not eat
+# the caller's answer budget. Sized from measurement, not taste: a stage-S-
+# sized prompt spent all of a 1024 budget on thinking and returned no text at
+# all, and cleared comfortably at 4096.
+_THINKING_ALLOWANCE = 4000
+
+
 # A 31B on two GPUs decodes at roughly 15-34 tok/s depending on load; 10 is a
 # deliberate floor, not an estimate. Used to size a request's wall clock.
 _MIN_DECODE_RATE = 10.0
@@ -87,11 +117,40 @@ def _request_timeout(budget: int, configured: float) -> float:
 # in `transport_retries`.
 _TRANSIENT = (openai.APIConnectionError, openai.APITimeoutError,
               openai.InternalServerError, openai.RateLimitError)
+_BAD_REQUEST = (openai.BadRequestError,)
+try:  # only when the Anthropic backend is actually installed
+    import anthropic as _anthropic
+    _TRANSIENT = _TRANSIENT + (
+        _anthropic.APIConnectionError, _anthropic.APITimeoutError,
+        _anthropic.InternalServerError, _anthropic.RateLimitError)
+    _BAD_REQUEST = _BAD_REQUEST + (_anthropic.BadRequestError,)
+except ImportError:
+    _anthropic = None
+
+
+# The one response shape both backends are reduced to before the shared retry
+# logic sees them: OpenAI's finish_reason=="length" and Anthropic's
+# stop_reason=="max_tokens" mean the same thing (budget exhausted, double it),
+# and conflating them here keeps ONE budget-doubling implementation instead of
+# two that can drift.
+class _Reply:
+    __slots__ = ("text", "truncated", "in_tokens", "out_tokens", "empty")
+
+    def __init__(self, text, truncated, in_tokens, out_tokens, empty=False):
+        self.text = text
+        self.truncated = truncated
+        self.in_tokens = in_tokens
+        self.out_tokens = out_tokens
+        self.empty = empty
 
 
 class LLM:
     def __init__(self, cfg: Config):
         self.cfg = cfg
+        self.backend = backend_of(cfg.worker_model)
+        # Cleared the first time Vertex's org policy rejects a constrained
+        # request; see _ask_anthropic.
+        self._structured_ok = True
         self.client = _make_client(cfg.worker_model,
                                    getattr(cfg, "request_timeout", 900))
         self.sem = asyncio.Semaphore(cfg.concurrency)
@@ -102,6 +161,98 @@ class LLM:
 
     MAX_TOKENS_CEILING = 16000
     MIN_TOKENS_FLOOR = 512  # below this a context-length clamp gives up
+
+    async def _ask_anthropic(self, prompt, system, budget, schema, timeout):
+        """One Anthropic Messages request, reduced to a `_Reply`.
+
+        Three differences from the vLLM path, all forced rather than chosen:
+
+        1. NO temperature / top_p / top_k. Claude 5-family models reject
+           non-default values with a 400 — `top_k` is not a parameter at all
+           and `top_p` 0.95 is not the default. The pipeline's Gemma sampling
+           settings therefore cannot be reproduced here; see MODEL_SERVERS.
+        2. `system` is a top-level field, not a message with role "system".
+        3. Structured output is `output_config.format`, not vLLM's
+           `structured_outputs` — and unlike vLLM's grammar backend this one
+           compiles `oneOf` (see CLAUDE.md's note on the split DECIDE/PATCH
+           schemas, which exist to work around the vLLM limitation).
+
+        Thinking is left at the model's default deliberately: the question this
+        backend exists to answer is whether a stronger model helps AS IT SHIPS.
+        MEASURED on this deployment, that default is thinking OFF — trivial
+        prompts come back `end_turn` with only a `text` block and no thinking
+        block, so the pipeline's existing token budgets are not being eaten by
+        reasoning. Do not assume that holds on another region or model; the
+        text-only extraction below is correct either way."""
+        if schema is not None and not self._structured_ok:
+            # The schema is unavailable as a GRAMMAR (org policy, below), so
+            # state it in the prompt instead. Without this the first reply is
+            # prose — the pipeline's JSON prompts never say "return JSON",
+            # because constrained decoding made saying so unnecessary — and
+            # every ask_json costs two calls while burning one of the two
+            # retries that exist for genuine failures.
+            prompt = (prompt + "\n\nReply with ONLY a JSON value conforming to "
+                      "this schema. No prose, no code fences.\n"
+                      + json.dumps(schema))
+        # THINKING SHARES max_tokens WITH THE ANSWER. Every budget in this
+        # pipeline was sized against a non-thinking model, so passing them
+        # through unchanged spends most of a small budget on reasoning and
+        # leaves the reply truncated or absent — measured: at max_tokens=1024
+        # a stage-S-sized prompt returned stop_reason=max_tokens with the
+        # entire 1024 consumed. The doubling loop above recovers, but at the
+        # cost of a wasted full-price call every time. max_tokens is a CAP,
+        # not a target: raising it does not make replies longer, it just stops
+        # thinking from crowding the answer out.
+        effective = min(budget + _THINKING_ALLOWANCE, self.MAX_TOKENS_CEILING)
+        kwargs = {
+            "model": self.cfg.worker_model,
+            "max_tokens": effective,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        if system:
+            kwargs["system"] = system
+        if schema is not None and self._structured_ok:
+            kwargs["output_config"] = {
+                "format": {"type": "json_schema", "schema": schema}}
+        try:
+            resp = await self.client.with_options(
+                timeout=timeout).messages.create(**kwargs)
+        except _BAD_REQUEST as e:
+            # Vertex gates partner-model features behind a GCP ORG POLICY
+            # (constraints/vertexai.allowedPartnerModelFeatures), and this
+            # project does not allow `structured_outputs` for Claude. That is
+            # an admin setting, not something a caller can pass around, so the
+            # run degrades to `ask_json`'s parse-and-retry backstop instead of
+            # dying. Latched per LLM instance: the policy will not change
+            # mid-run, and retrying the blocked shape on every call would
+            # double the request count for nothing.
+            if ("structured_outputs" in str(e)
+                    and "allowedPartnerModelFeatures" in str(e)):
+                if self._structured_ok:
+                    self._structured_ok = False
+                    print("[llm] Vertex org policy blocks structured_outputs "
+                          "for this model — falling back to JSON parsing with "
+                          "retries (ask_json's designed backstop)")
+                kwargs.pop("output_config", None)
+                resp = await self.client.with_options(
+                    timeout=timeout).messages.create(**kwargs)
+            else:
+                raise
+        # A refusal is a successful HTTP 200 with no usable content. Surface it
+        # as an error rather than returning "" — an empty string downstream
+        # looks like a model that had nothing to say, which is a different and
+        # much harder failure to trace back to here.
+        if resp.stop_reason == "refusal":
+            cat = getattr(getattr(resp, "stop_details", None), "category", None)
+            raise RuntimeError(f"Claude refused the request (category={cat})")
+        text = "".join(b.text for b in resp.content if b.type == "text")
+        return _Reply(
+            text=text,
+            truncated=resp.stop_reason == "max_tokens",
+            in_tokens=resp.usage.input_tokens,
+            out_tokens=resp.usage.output_tokens,
+            empty=not text.strip(),
+        )
 
     async def ask(self, prompt: str, system: str | None = None,
                   max_tokens: int | None = None,
@@ -146,17 +297,31 @@ class LLM:
                         # becomes impossible rather than merely unlikely. Lets
                         # sampling stay at the model's own recommended values.
                         extra["structured_outputs"] = {"json": schema}
-                    resp = await self.client.chat.completions.create(
-                        model=self.cfg.worker_model,
-                        max_tokens=budget,
-                        messages=messages,
-                        temperature=self.cfg.temperature,
-                        top_p=self.cfg.top_p,
-                        # top_k is not an OpenAI field; vLLM accepts it here
-                        extra_body=extra,
-                        timeout=_request_timeout(budget, configured),
-                    )
-                except openai.BadRequestError as e:
+                    if self.backend == "anthropic-vertex":
+                        reply = await self._ask_anthropic(
+                            prompt, system, budget, schema,
+                            _request_timeout(budget, configured))
+                    else:
+                        resp = await self.client.chat.completions.create(
+                            model=self.cfg.worker_model,
+                            max_tokens=budget,
+                            messages=messages,
+                            temperature=self.cfg.temperature,
+                            top_p=self.cfg.top_p,
+                            # top_k is not an OpenAI field; vLLM accepts it here
+                            extra_body=extra,
+                            timeout=_request_timeout(budget, configured),
+                        )
+                        reply = _Reply(
+                            text=(resp.choices[0].message.content or ""
+                                  if resp.choices else ""),
+                            truncated=(bool(resp.choices) and
+                                       resp.choices[0].finish_reason == "length"),
+                            in_tokens=resp.usage.prompt_tokens if resp.usage else 0,
+                            out_tokens=resp.usage.completion_tokens if resp.usage else 0,
+                            empty=not resp.choices,
+                        )
+                except _BAD_REQUEST as e:
                     if "maximum context length" in str(e) and budget > self.MIN_TOKENS_FLOOR:
                         budget = max(budget // 2, self.MIN_TOKENS_FLOOR)
                         continue
@@ -176,26 +341,34 @@ class LLM:
                     await asyncio.sleep(delay)
                     continue
             self.calls += 1
-            if resp.usage:
-                self.input_tokens += resp.usage.prompt_tokens
-                self.output_tokens += resp.usage.completion_tokens
+            self.input_tokens += reply.in_tokens
+            self.output_tokens += reply.out_tokens
             # vLLM can return a well-formed response carrying no choices (an
             # aborted or preempted request). Indexing [0] made that an
             # IndexError, which — before gather_units — killed the whole stage.
             # Treat it as transient: it is a server-side hiccup, not a bad
             # prompt, and the next draw normally succeeds.
-            if not resp.choices:
+            # TRUNCATION IS CHECKED FIRST, and the order is load-bearing. An
+            # empty reply that was ALSO truncated is not a server hiccup — on
+            # the Anthropic backend it is thinking having consumed the whole
+            # budget before any text was emitted. Retrying that at the SAME
+            # budget reproduces it exactly; only doubling escapes. Checking
+            # `empty` first turned every such call into
+            # "server returned no choices after 3 retries" and killed
+            # binary_heap_sonnet5_t1's discovery outright.
+            if reply.truncated and budget < self.MAX_TOKENS_CEILING:
+                budget = min(budget * 2, self.MAX_TOKENS_CEILING)
+                continue
+            if reply.empty:
                 if attempt >= max_transport:
                     raise RuntimeError(
-                        f"server returned no choices after {attempt} retries")
+                        f"server returned no usable content after {attempt} "
+                        f"retries (budget {budget}, truncated={reply.truncated})")
                 attempt += 1
                 self.transport_retries += 1
-                print(f"[llm] empty choices — retry {attempt}/{max_transport}")
+                print(f"[llm] empty reply — retry {attempt}/{max_transport}")
                 continue
-            choice = resp.choices[0]
-            if choice.finish_reason != "length" or budget >= self.MAX_TOKENS_CEILING:
-                return choice.message.content or ""
-            budget = min(budget * 2, self.MAX_TOKENS_CEILING)
+            return reply.text
 
     async def ask_json(self, prompt: str, system: str | None = None,
                        max_tokens: int | None = None, retries: int = 2,

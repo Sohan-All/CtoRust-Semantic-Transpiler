@@ -12,7 +12,8 @@ import json
 
 from llm import LLM, extract_json
 from state import Explanation
-from rustgen.common import extract_rust, illegal_stubs, unit_block
+from rustgen.common import (extract_rust, illegal_stubs, illegal_type_bodies,
+                            stubbed_callbacks, unit_block)
 
 # Regeneration attempts for a types block that stubs a unit's behaviour (see
 # synthesize_types). Same budget as stage C's pre-flight, for the same reason:
@@ -37,6 +38,33 @@ differential tests.
 You are designing types, not behaviour. Emit the data definitions, the error
 enum with its Display/Error impls, and the `*_deps` stubs — and nothing that
 has a body a unit ought to be writing."""
+
+BODY_RETRY_NOTE = """\
+Your previous reply is rejected: {problem}.
+
+You are designing TYPES. A method with a working body is a unit's job, not
+yours, and writing one here does not help that unit — it collides with it.
+Rust refuses two inherent methods of the same name on one type whatever their
+signatures, so `impl Scheduler {{ fn spawn(&mut self, task: SchedTask) }}`
+here and the unit's own four-argument `spawn` are a hard error, and by then
+neither side can be removed without deleting real code.
+
+Emit the data definitions, the error enum with its Display/Error impls, and
+the `*_deps` stubs. Nothing else. If a behavior seems to need a method, that
+is a signal the unit stage will write it — leave the type bare."""
+
+CALLBACK_RETRY_NOTE = """\
+Your previous reply is rejected: {problem}.
+
+Those names are PARAMETERS of the C functions, not functions implemented
+elsewhere. The C declares them as function pointers, e.g.
+`bool cc_array_filter(CC_Array *ar, bool (*pred)(const void *))` — `pred` is
+supplied fresh by each caller, so there is no single implementation and a
+`deps` stub for it can never be filled. It compiles, then panics.
+
+Remove those stubs entirely. The unit that receives the callback will take a
+generic parameter bounded by `Fn`/`FnMut` and call it directly; nothing needs
+to exist in the types block for that to work."""
 
 TYPES_PROMPT = """\
 A C source file has been decomposed into behavioral units, each described in
@@ -73,6 +101,14 @@ Produce:
    implementations will use Rust std instead. Do NOT stub any function named
    as a SIBLING FILE function above, if that section is present — those are
    called directly, never stubbed.
+   Do NOT stub a CALLBACK the caller supplies. A C parameter like
+   `bool (*pred)(const void *)` or `ArrayListCompareFunc compare_func` is a
+   PARAMETER, not an external function: the unit that receives it takes a
+   generic bounded by `Fn`/`FnMut` and calls it. There is no single
+   implementation to stub, because every caller passes a different one, so a
+   `deps` stub for it can never be filled and will panic at run time. If a unit
+   description says a function "applies the caller's comparison function" or
+   similar, that is this case.
 3. A GLOSSARY mapping each recurring concept phrase from the descriptions to
    its Rust type name.
 
@@ -95,10 +131,26 @@ GLOSSARY:
 async def synthesize_types(llm: LLM, units: list[Explanation],
                            max_tokens: int,
                            project_block: str = "",
-                           failures: list[dict] | None = None) -> tuple[str, dict]:
+                           failures: list[dict] | None = None,
+                           notes: list[dict] | None = None,
+                           repair: bool = True,
+                           context_rs: str = "",
+                           c_source: str = "",
+                           callback_names: frozenset[str] = frozenset()
+                           ) -> tuple[str, dict]:
     """`project_block` (multi-file translation): shared project types +
     sibling-function notice, prepended as fixed context — this file's Stage T
     then defines ONLY file-local types and must not re-stub sibling fns.
+
+    `repair` (cfg.rustgen_types_repair, ablation only) runs a targeted repair
+    when the gates exhaust their retries instead of giving up there. `context_rs`
+    is the project's already-generated shared Rust — the repair compiles the
+    block against it, so a cross-file reference is not mistaken for a defect the
+    repair introduced. `c_source` is this file's C, for the repair's questions.
+
+    `notes` receives a record when the repair SUCCEEDS — a separate list from
+    `failures` on purpose, because `failures` is the caller's degraded list and
+    anything in it voids the run. A rescued block is the opposite of a loss.
 
     `failures` receives a record when the stub gate exhausts its retries. That
     outcome is not survivable in practice and used to be a printed warning the
@@ -136,16 +188,72 @@ async def synthesize_types(llm: LLM, units: list[Explanation],
         else:
             rust_part = reply
         types_rs = extract_rust(rust_part)
-        problem = illegal_stubs(types_rs)
+        # Two distinct defects, deliberately reported separately: a stubbed
+        # body invents a phantom API units defer to, an IMPLEMENTED body
+        # duplicates one a unit will write. Both end as an impl block the
+        # compile loop cannot repair, from opposite directions, and the retry
+        # note that helps one would confuse the other.
+        # Checked FIRST and reported separately. A callback stub is also a
+        # `todo!()` inside a `*_deps` module, which `illegal_stubs` permits by
+        # design — so without its own check this shape is invisible, and it is
+        # the one `sibling_deps` has been observed FABRICATING a body for
+        # (`cp` -> `Ok(item.clone())`) rather than leaving as an honest stub.
+        problem = (stubbed_callbacks(types_rs, callback_names)
+                   or illegal_stubs(types_rs) or illegal_type_bodies(types_rs))
         if not problem:
             break
+        note = (CALLBACK_RETRY_NOTE if "CALLBACK" in problem else
+                STUB_RETRY_NOTE if "stub" in problem else BODY_RETRY_NOTE)
         if attempt < TYPES_RETRIES:
-            prompt = base_prompt + "\n\n" + STUB_RETRY_NOTE.format(problem=problem)
+            prompt = base_prompt + "\n\n" + note.format(problem=problem)
     else:
-        # exhausted: keep the last draw (the compile loop and the assembled
-        # crate's stub gate still get a say) but make it loud in the log AND
-        # in the record — a printed warning alone let a doomed run proceed to
-        # scoring as if it were ordinary
+        # Exhausted. Regenerating from the same prompt is re-rolling the dice at
+        # temperature 1.0, and the outcome is not survivable: over 255 recorded
+        # run logs, EVERY run reaching this branch died (4 BUILD_FAILED, 3
+        # STUB_CRATE, none scored). So try a targeted repair before giving up —
+        # it is told what is wrong, it can ask which units own the behaviour,
+        # and its output has to survive four checks including a real cargo
+        # check. It cannot make a good block worse: on any failure the original
+        # comes back and this branch proceeds exactly as it did before.
+        if repair:
+            from rustgen.types_repair import repair_types_block
+            repaired, rep = await repair_types_block(
+                llm, types_rs, problem, units,
+                context_rs=context_rs, c_source=c_source,
+                max_tokens=max_tokens)
+            if rep.get("repaired"):
+                fixed = illegal_stubs(repaired) or illegal_type_bodies(repaired)
+                if not fixed:
+                    print(f"[types] repaired after {rep['rounds']} round(s) "
+                          f"(asked: {', '.join(rep['questions']) or 'nothing'})")
+                    # A SUCCESS goes to `notes`, never to `failures`. This
+                    # record used to land in `failures`, which is the degraded
+                    # list — so the one outcome this module exists to produce
+                    # marked its own run INCOMPLETE and unscoreable, and the
+                    # record carried no `error` key so the degraded printer
+                    # died on KeyError before the run could even be voided
+                    # quietly. Both firings in the 08-03 batch were repairs
+                    # that WORKED on crates that then compiled clean
+                    # (binary_heap srvB t12 12/12, cc_array srvA t3 21/21).
+                    # The crash was the only reason it was visible.
+                    if notes is not None:
+                        notes.append({"stage": "types",
+                                      "unit": "(shared types)",
+                                      "repaired": True,
+                                      "rounds": rep["rounds"],
+                                      "questions": rep.get("questions", []),
+                                      "note": f"types repair: {rep['why']}"})
+                    return repaired, glossary if isinstance(glossary, dict) else {}
+                # a repair that passed validate_repair but not the gates should
+                # be impossible; if it happens, keep the original and say so
+                problem = fixed
+            print(f"[types] repair did not resolve it "
+                  f"({rep.get('action')}: {rep.get('why') or '-'})")
+
+        # keep the last draw (the compile loop and the assembled crate's stub
+        # gate still get a say) but make it loud in the log AND in the record —
+        # a printed warning alone let a doomed run proceed to scoring as if it
+        # were ordinary
         print(f"[types] {problem} — still present after {TYPES_RETRIES} "
               f"retries; units may defer to these stubs")
         if failures is not None:

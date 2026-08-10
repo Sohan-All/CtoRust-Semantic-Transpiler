@@ -50,6 +50,11 @@ check each against this unit, and apply only the ones whose IF matches.
   helpers are allowed: nest a single-use helper as a `fn` inside its caller;
   a module-level helper gets a short descriptive snake_case name. Never embed
   a unit id in an identifier.
+- A callback the caller supplies is a PARAMETER. If your signature takes a
+  generic bounded by `Fn`/`FnMut`, call that parameter directly — `pred(item)`.
+  Never route it through a `deps::` stub, never define a free function to stand
+  in for it, and never invent a body for it: each caller passes different
+  behavior, so any fixed implementation is wrong and compiles anyway.
 - Visibility: `pub(crate)` on every item (fn, struct, trait, impl-block
   methods, const). Only the program's designated entry point and
   `#[no_mangle]` FFI exports are `pub`.

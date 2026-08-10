@@ -10,6 +10,7 @@ Line numbers are 1-indexed and inclusive throughout, matching editor conventions
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 import tree_sitter_c
@@ -51,6 +52,12 @@ class SeedBlock:
     call_sites: dict[str, list[str]] = field(default_factory=dict)
     is_public: bool = False      # function without `static` (part of the C ABI surface)
     c_signature: str = ""        # declaration text up to the body, for FFI shims
+    # parameter name -> its C declaration, for parameters that ARE functions
+    # (`int (*cmp)(const void *, const void *)`). Held separately because these
+    # are the one kind of callee that is neither same-file nor external: the
+    # CALLER supplies the behaviour, so the answer is a generic bounded by `Fn`,
+    # never a `_deps` stub. See _callback_params for what that mistake cost.
+    callback_params: dict[str, str] = field(default_factory=dict)
 
     def text(self, source_lines: list[str]) -> str:
         return "\n".join(source_lines[self.start - 1 : self.end])
@@ -75,6 +82,7 @@ class SeedGraph:
                     "call_sites": b.call_sites,
                     "is_public": b.is_public,
                     "c_signature": b.c_signature,
+                    "callback_params": b.callback_params,
                 }
                 for b in self.blocks
             ],
@@ -127,6 +135,102 @@ def _c_signature(node, source: str) -> str:
     end_byte = body.start_byte if body is not None else node.end_byte
     sig = source.encode()[node.start_byte:end_byte].decode(errors="replace")
     return " ".join(sig.split())
+
+
+def _split_top_level(params: str) -> list[str]:
+    """Split a C parameter list on commas at paren depth 0.
+
+    A function-pointer parameter carries its own commas inside its own parens —
+    `int (*cmp)(const void *, const void *)` is ONE parameter containing two —
+    so a plain `.split(",")` shreds exactly the parameters this module exists to
+    find."""
+    out, depth, cur = [], 0, ""
+    for ch in params:
+        if ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+        if ch == "," and depth == 0:
+            out.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    if cur.strip():
+        out.append(cur)
+    return [p.strip() for p in out if p.strip()]
+
+
+# `(*name)(` — a parameter that IS a function. The name is optional in a
+# declaration (`void (*)(void)`); an unnamed one cannot be called from the body
+# and so cannot be misread as an external call, which is what this detects for.
+_FN_PTR_PARAM = re.compile(r"\(\s*\*\s*(\w+)\s*\)\s*\(")
+
+# `typedef int (*avl_compare_t)(...)` — the SAME parameter written through a
+# name. Every corpus project that does this keeps the typedef in a HEADER, so a
+# single .c file's text can never resolve it; `fn_pointer_typedefs` is run over
+# the project's headers and the names handed to `chunk`.
+_FN_PTR_TYPEDEF = re.compile(r"typedef\s+[\w\s\*]+\(\s*\*\s*(\w+)\s*\)\s*\(")
+
+
+def fn_pointer_typedefs(text: str) -> set[str]:
+    """Names typedef'd to a function-pointer type, e.g. `ArrayListCompareFunc`.
+
+    Callers pass the union over a project's headers into `chunk`. Without it the
+    detection below is blind to `void arraylist_sort(ArrayListCompareFunc cmp)`,
+    which is how 5 of the 28 corpus projects declare their callbacks — including
+    `array_list`, `binary_heap` and `binomial_heap`. Missing them leaks
+    `compare_func` and `callback` into `calls_external` exactly as the raw
+    `(*fn)(...)` form did."""
+    return set(_FN_PTR_TYPEDEF.findall(text))
+
+
+def _callback_params(c_signature: str,
+                     fn_ptr_types: frozenset[str] = frozenset()) -> dict[str, str]:
+    """{parameter name: its full C declaration text} for every function-pointer
+    parameter of a function.
+
+    WHY THIS EXISTS. `calls_external` is "callees not defined in this file",
+    which is the right test for a sibling or a libc call and the WRONG one for a
+    callback parameter: the body calls `pred(item)`, `pred` is a parameter, and
+    it lands in external deps. Stage T then stubs it in `<stem>_deps` as a
+    single global function — unfillable by construction, because the callers
+    pass a different predicate at each call site — and `sibling_deps` has been
+    observed INVENTING a body for one (`cp` -> `Ok(item.clone())`), which
+    compiles and is silently wrong. Voided every `cc_array` run ever recorded.
+
+    Operates on `c_signature` (already whitespace-collapsed, and populated for
+    every block of a function including split ones), so no tree-sitter walk is
+    needed and split `sub_statement` blocks are covered for free."""
+    open_paren = c_signature.find("(")
+    if open_paren < 0:
+        return {}
+    # the parameter list is the balanced span after the FIRST `(` — for
+    # `char *(*factory(int n))(void)` that is `int n`, the parameters of the
+    # function being defined, which is what we want
+    depth, close = 0, -1
+    for i in range(open_paren, len(c_signature)):
+        if c_signature[i] == "(":
+            depth += 1
+        elif c_signature[i] == ")":
+            depth -= 1
+            if depth == 0:
+                close = i
+                break
+    if close < 0:
+        return {}
+    out: dict[str, str] = {}
+    for p in _split_top_level(c_signature[open_paren + 1:close]):
+        m = _FN_PTR_PARAM.search(p)
+        if m:
+            out[m.group(1)] = p
+            continue
+        # `ArrayListCompareFunc compare_func` — same thing through a typedef.
+        # Take the LAST identifier as the parameter name; a bare `Fn_t` with no
+        # name cannot be called from the body, so it is correctly skipped.
+        words = re.findall(r"\w+", p)
+        if len(words) >= 2 and words[-2] in fn_ptr_types:
+            out[words[-1]] = p
+    return out
 
 
 def _collect_calls(node) -> list[str]:
@@ -205,7 +309,17 @@ def _split_large_function(node, fid_base: str, name: str | None, threshold: int)
     ]
 
 
-def chunk(source: str, split_over: int = 40) -> SeedGraph:
+def chunk(source: str, split_over: int = 40,
+          fn_ptr_types: frozenset[str] | None = None) -> SeedGraph:
+    """`fn_ptr_types`: names typedef'd to function-pointer types, from
+    `fn_pointer_typedefs` over the project's HEADERS. Optional and defaulted so
+    every existing caller keeps working — omitting it only costs the typedef'd
+    form of a callback parameter, never the literal `(*fn)(...)` one. The
+    typedefs are unioned from the whole project because a .c file's callbacks
+    are declared in a .h it includes."""
+    fn_ptr_types = fn_ptr_types if fn_ptr_types is not None else frozenset()
+    # the file's own typedefs count too, without the caller having to know
+    fn_ptr_types = fn_ptr_types | fn_pointer_typedefs(source)
     parser = Parser(C_LANGUAGE)
     tree = parser.parse(source.encode())
     source_lines = source.split("\n")
@@ -292,8 +406,18 @@ def chunk(source: str, split_over: int = 40) -> SeedGraph:
     for b in blocks:
         if b.function and b.function in fn_calls:
             calls = fn_calls[b.function]
+            # A function-pointer PARAMETER is called by name in the body but is
+            # neither defined here nor implemented elsewhere — the caller
+            # supplies it. Pull those out before the external split, or they are
+            # handed to stage T as external domain functions and stubbed in
+            # `<stem>_deps`, which is unfillable and has been observed being
+            # fabricated instead. `calls_internal` is deliberately left alone: a
+            # parameter shadowing a same-file function name is pathological, and
+            # the existing behaviour there is no worse than before.
+            b.callback_params = _callback_params(b.c_signature, fn_ptr_types)
             b.calls_internal = [c for c in calls if c in defined and c != b.function]
-            b.calls_external = [c for c in calls if c not in defined]
+            b.calls_external = [c for c in calls
+                                if c not in defined and c not in b.callback_params]
             # every callee, not just same-file ones: in a multi-file project
             # roughly half the call graph crosses a file boundary (18/42 of
             # binary_heap's functions, 24/49 of double_linked_list's), and

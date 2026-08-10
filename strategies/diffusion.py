@@ -93,7 +93,8 @@ class DiffusionStrategy:
         self.block_calls: dict[str, set[str]] = {}    # block id -> callee block ids
 
     async def run(self, source: str, source_name: str) -> None:
-        graph = chunk(source, self.cfg.split_function_over_lines)
+        graph = chunk(source, self.cfg.split_function_over_lines,
+                      fn_ptr_types=frozenset(self.cfg.fn_ptr_typedefs))
         self.store.write_record(graph.to_record())
         self.block_calls = {b.id: set() for b in graph.blocks}
         for a, b in graph.call_edges:

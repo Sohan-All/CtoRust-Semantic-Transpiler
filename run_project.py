@@ -194,10 +194,20 @@ async def phase_rustgen(c_root: Path, idx: ProjectIndex) -> None:
     # todo!(), which illegal_stubs() deliberately permits, so the stub gate
     # would pass it. This record is what makes the loss visible.
     degraded: list[dict] = []
+    # Successful stage-T repairs. Deliberately NOT `degraded`: a rescued shared
+    # block is a save, and putting it in the degraded list made the run
+    # unscoreable for having been fixed.
+    repairs: list[dict] = []
 
     xcalls = project_call_texts(c_root, idx, cfg.split_function_over_lines)
     xstatus = (project_exit_status(c_root, idx) if cfg.rustgen_exit_status
                else {})
+    # Function-pointer typedefs, unioned over the whole project. Every corpus
+    # project that declares a callback this way (`ArrayListCompareFunc cmp`)
+    # puts the typedef in a HEADER, so a .c file cannot resolve its own
+    # callbacks — the chunker would hand `compare_func` to stage T as an
+    # external domain function and get it stubbed in `<stem>_deps`.
+    xfnptr = project_fn_ptr_types(c_root)
 
     order = [f for g in idx.groups for f in g]
 
@@ -253,7 +263,25 @@ async def phase_rustgen(c_root: Path, idx: ProjectIndex) -> None:
         store = Store.load(files_dir(c_root) / stem)
         units = store.final_units()
         if not units:
+            # A file that produced NO units is a silently missing chunk of the
+            # program, and until 2026-08-04 this `continue` ran before the
+            # degraded check — so the loss was invisible to every gate.
+            # OBSERVED, not hypothetical: binary_heap_sonnet5_t1 lost 4 of 5
+            # files this way (discovery raised on each), assembled a crate from
+            # 1 unit of ~14, compiled CLEAN at 1/1 sections, passed the stub and
+            # DEGRADED gates, and scored DIVERGE 16/16 as though it were an
+            # ordinary translation.
+            #
+            # CLAUDE.md carried this as "mostly self-announcing — the file's
+            # functions do not exist, callers reference them, E0425 ->
+            # BUILD_FAILED". That reasoning does not hold: when the surviving
+            # units are the ones doing the CALLING, nothing is left to dangle
+            # and the crate builds. A wrong verdict is worse than a void one.
             print(f"[rustgen] {fname}: no units, skipped")
+            degraded.append({"stage": "mtu", "file": fname,
+                             "error": "discovery produced no units for this "
+                                      "file — the crate is missing everything "
+                                      "it defines"})
             continue
 
         prev_types = None
@@ -267,7 +295,21 @@ async def phase_rustgen(c_root: Path, idx: ProjectIndex) -> None:
                 llm, units, cfg.rustgen_types_max_tokens,
                 project_block=_project_block(shared_rs, pglossary, registry,
                                              idx, fname),
-                failures=degraded)
+                failures=degraded,
+                notes=repairs,
+                # every callback parameter this file's C declares, so stage T
+                # cannot stub one in `<stem>_deps` where nothing can fill it
+                callback_names=file_callback_names(c_root, fname, xfnptr,
+                                                   cfg.split_function_over_lines),
+                repair=getattr(cfg, "rustgen_types_repair", True),
+                # the repair compiles its candidate against the shared types
+                # this file was written against, so a legitimate cross-file
+                # reference is not charged to the repair as a new error
+                context_rs=shared_rs,
+                # idx.groups carries paths relative to c_root ("src/cli.c"),
+                # not bare filenames — c_root / "src" / fname doubles the dir
+                c_source=(c_root / fname).read_text(errors="ignore")
+                if (c_root / fname).exists() else "")
             store.write_record({"type": "rust_types", "types_rs": file_types,
                                 "glossary": glossary, "project": True})
 
@@ -321,7 +363,9 @@ async def phase_rustgen(c_root: Path, idx: ProjectIndex) -> None:
                              exit_status=xstatus.get(fname),
                              call_sites=cfg.rustgen_call_sites,
                              symbol_map=cfg.rustgen_symbol_map,
-                             output_formats=cfg.rustgen_output_formats)
+                             output_formats=cfg.rustgen_output_formats,
+                             callback_params=cfg.rustgen_callback_params,
+                             fn_ptr_types=xfnptr)
 
         # Both stages persist per unit as it lands (the on_result callbacks
         # below) rather than after the parallel barrier. Writing after the
@@ -429,6 +473,80 @@ async def phase_rustgen(c_root: Path, idx: ProjectIndex) -> None:
         types_all, all_code, _, report = await compile_loop(
             cfg, llm, crate, all_units, all_specs, types_all, all_code,
             reassemble, "")
+
+        # Stub repair runs HERE, after the compile loop, not before it. The
+        # compile loop is a net stub PRODUCER — across every recorded run,
+        # repairs introduced a stub 13 times and removed one 6 times — so a
+        # pass placed before it would miss its output. That is the "a gate must
+        # cover every writer" rule applied to the last writer in the chain.
+        if getattr(cfg, "rustgen_stub_repair", True):
+            from rustgen.stub_repair import (StubContext, SHARED_ID,
+                                             repair_stubs)
+            from rustgen.compile_loop import cargo_check
+
+            # BASELINE FIRST. The check must reject only what the patch made
+            # WORSE, never the errors it inherited: on a run that ended at
+            # `final: N > 0` an absolute check charges every pre-existing error
+            # to the patch and refuses all of them. Same asymmetry as
+            # `parse_regression` and `types_repair.compile_regression`.
+            try:
+                _base_errs = len(cargo_check(crate))
+            except Exception:
+                _base_errs = None                 # cargo unusable: skip the gate
+
+            def _compile_check(trial: dict[str, str]) -> str:
+                if _base_errs is None:
+                    return ""                     # not a verdict, do not reject
+                t_rs = trial.get(SHARED_ID, types_all)
+                code = {k: v for k, v in trial.items() if k != SHARED_ID}
+                reassemble(t_rs, code, "")
+                try:
+                    errs = cargo_check(crate)
+                except Exception:                 # cargo missing/timeout
+                    return ""
+                if len(errs) <= _base_errs:
+                    return ""
+                return "\n".join(
+                    e.get("rendered") or e.get("message", "") for e in errs[:6])
+
+            sections = dict(all_code)
+            sections[SHARED_ID] = types_all
+            ctx = StubContext(
+                (crate / "src/lib.rs").read_text(errors="ignore"),
+                all_units,
+                c_sources={f: (c_root / f).read_text(errors="ignore")
+                           for f in order if (c_root / f).exists()},
+                # xcalls is {defining file: {C fn: call expressions}}; the
+                # loop asks by function name, so flatten one level
+                call_texts={k: v for d in xcalls.values()
+                            for k, v in d.items()} if xcalls else {},
+                specs=all_specs,
+                blind=not getattr(cfg, "rustgen_stub_context", True))
+            sections, sreport = await repair_stubs(
+                llm, sections, all_units, ctx, shared_id=SHARED_ID,
+                compile_check=_compile_check,
+                max_tokens=cfg.rustgen_repair_max_tokens)
+            if sreport.considered or sreport.skipped_shared:
+                print(sreport.summary())
+                _record(pdir, {"type": "event", "event": "stub_repair",
+                               "considered": sreport.considered,
+                               "resolved": sreport.resolved,
+                               "gave_up": sreport.gave_up,
+                               "rejected": sreport.rejected,
+                               "errored": sreport.errored,
+                               "skipped_shared": sreport.skipped_shared,
+                               "details": sreport.details})
+            # UNCONDITIONAL. `_compile_check` reassembles the crate on disk to
+            # test a candidate, so after a REJECTED patch lib.rs still holds
+            # it. Rebuilding only `if sreport.resolved` would ship that
+            # rejected patch whenever the loop attempted something and resolved
+            # nothing — which is a common outcome, and would turn a clean run
+            # into a corrupted one. `sections` is the accepted state either
+            # way, so writing it back is always correct.
+            types_all = sections.get(SHARED_ID, types_all)
+            all_code = {k: v for k, v in sections.items() if k != SHARED_ID}
+            reassemble(types_all, all_code, "")
+
         # persist repairs to the per-file stores or the next resume silently
         # reverts them (run_rust learned this the hard way; same rule here)
         for uid, rust in all_code.items():
@@ -465,14 +583,25 @@ async def phase_rustgen(c_root: Path, idx: ProjectIndex) -> None:
     # Last, so it covers every stage above. Written only when something was
     # actually lost — an absent record means a clean run, which is what the
     # harness gate reads.
+    if repairs:
+        _record(pdir, {"type": "types_repair", "count": len(repairs),
+                       "repairs": repairs})
+        for r in repairs:
+            print(f"[types] rescued {r.get('unit')} in {r.get('rounds')} "
+                  f"round(s) — run is NOT degraded by this")
+
     if degraded:
         _record(pdir, {"type": "degraded", "count": len(degraded),
                        "failures": degraded})
         print(f"[degraded] {len(degraded)} unit(s)/stage(s) failed and were "
               f"dropped — this crate is INCOMPLETE and must not be scored:")
         for d in degraded:
+            # .get, not [..]: a record that reaches this list without an
+            # `error` key is a bug in whoever appended it, but crashing the
+            # printer destroys a finished run and buries the real cause under
+            # a KeyError traceback. Report the malformed record instead.
             print(f"  - {d['stage']} {d.get('unit') or d.get('file')}: "
-                  f"{d['error']}")
+                  f"{d.get('error') or f'(no error recorded: {d})'}")
 
 
 def project_call_texts(c_root: Path, idx: ProjectIndex,
@@ -490,7 +619,8 @@ def project_call_texts(c_root: Path, idx: ProjectIndex,
     per_file: dict[str, dict[str, set[str]]] = {}
     for fname in idx.files:
         sites: dict[str, set[str]] = {}
-        for b in chunk((c_root / fname).read_text(), split_over).blocks:
+        for b in chunk((c_root / fname).read_text(), split_over,
+                       fn_ptr_types=project_fn_ptr_types(c_root)).blocks:
             for callee, texts in (getattr(b, "call_sites", {}) or {}).items():
                 sites.setdefault(callee, set()).update(texts)
         per_file[fname] = sites
@@ -501,6 +631,50 @@ def project_call_texts(c_root: Path, idx: ProjectIndex,
             if caller_file != owner and fn in sites:
                 out[owner].setdefault(fn, []).extend(sites[fn])
     return {f: {fn: sorted(set(t)) for fn, t in m.items()} for f, m in out.items()}
+
+
+def file_callback_names(c_root: Path, fname: str, fn_ptr_types: frozenset[str],
+                        split_over: int) -> frozenset[str]:
+    """Every function-pointer PARAMETER name declared in one C file.
+
+    Feeds the `stubbed_callbacks` gate, which refuses a `<stem>_deps` stub for
+    one of these. Per-file rather than project-wide on purpose: the gate names
+    the offending stub in its retry note, and a project-wide set would let one
+    file's `cmp` reject another file's genuinely-external `cmp`."""
+    from chunker import chunk
+    try:
+        src = (c_root / fname).read_text()
+    except OSError:
+        return frozenset()
+    g = chunk(src, split_over, fn_ptr_types=fn_ptr_types)
+    return frozenset(n for b in g.blocks for n in b.callback_params)
+
+
+def project_fn_ptr_types(c_root: Path) -> frozenset[str]:
+    """Names typedef'd to a function-pointer type, over the whole project.
+
+    Scans HEADERS as well as sources, because that is where they live: all five
+    corpus projects that declare callbacks this way (`array_list`,
+    `binary_heap`, `binomial_heap`, `bloom_filter`, `avl`) put the typedef in a
+    .h and the parameter in a .c. Without the union a file cannot resolve its
+    own callback parameters, and `arraylist_sort_internal(ArrayListCompareFunc
+    compare_func)` leaks `compare_func` into `calls_external` — where stage T
+    stubs it in `<stem>_deps` as a single global function that no caller can
+    ever supply. Project-wide rather than per-include because C's include graph
+    is not parsed here and a superset is harmless: a name that is a
+    function-pointer typedef ANYWHERE in the project is not a plain type.
+    """
+    from chunker import fn_pointer_typedefs
+    src = c_root / "src"
+    if not src.is_dir():
+        src = c_root
+    out: set[str] = set()
+    for f in list(src.rglob("*.h")) + list(src.rglob("*.c")):
+        try:
+            out |= fn_pointer_typedefs(f.read_text(errors="replace"))
+        except OSError:
+            continue
+    return frozenset(out)
 
 
 def project_exit_status(c_root: Path, idx: ProjectIndex) -> dict[str, dict]:

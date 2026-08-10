@@ -218,12 +218,67 @@ def main() -> int:
     test_pass_sees_every_file_and_qualifies_ids()
     test_failure_degrades_and_is_recorded()
     test_malformed_concerns_are_dropped()
+    test_prohibitions_are_scoped()
     print()
     if _failures:
         print(f"{len(_failures)} FAILURE(S): " + ", ".join(_failures))
         return 1
     print("ALL PASS")
     return 0
+
+
+def test_prohibitions_are_scoped() -> None:
+    """`must_not_implement` must not be the global complement.
+
+    Scoping the pass to the project made `owns` project-wide, which was the
+    point — and made the PROHIBITION list project-wide too, which was not.
+    Per-file it averaged 1.9 entries per unit; project-wide it averaged 17-29,
+    so a unit's own assigned concern sat inside ~25 near-identical "never
+    implement these" lines naming items in files it never touches.
+    `array_list base_srvB_t6`: project__exp_0001 owned `impl Project
+    constructor`, carried 29 prohibitions beside it, and its repair deleted the
+    constructor it owned.
+    """
+    print("\n=== prohibitions are scoped to types the unit mentions ===")
+    from rustgen.spec_stage import generate_specs
+
+    concerns = [
+        {"concern": "impl Task constructor", "owner": "task__exp_0001"},
+        {"concern": "impl fmt::Display for Task", "owner": "task__exp_0003"},
+        {"concern": "impl Drop for Workspace", "owner": "workspace__exp_0001"},
+        {"concern": "impl Activity constructor", "owner": "activity__exp_0001"},
+    ]
+    us = [Explanation(id="exp_0001", text="Builds a Task and prints it",
+                      invariants=["a Task must have a title"],
+                      ranges=[(1, 5)], status="locked")]
+    out = asyncio.run(generate_specs(_CountingLLM(), us, "", {}, RICH,
+                                     concerns=concerns, id_prefix="demo__"))
+    # The RECORD stays complete — it is the audit trail of who owns what, and
+    # filtering it would lose information. Only the PROMPT is scoped.
+    mni = out["exp_0001"]["must_not_implement"]
+    check("the full owner map still reaches the spec record",
+          len(mni) == 4, str(mni))
+
+    # what the PROMPT carries is the filtered set — that is the flood fix
+    import rustgen.spec_stage as ss
+    seen = {}
+
+    class _Capture(_CountingLLM):
+        async def ask_json(self, prompt, **kw):
+            if not self._is_responsibility(prompt):
+                seen["prompt"] = prompt
+            return await super().ask_json(prompt, **kw)
+
+    asyncio.run(generate_specs(_Capture(), us, "", {}, RICH,
+                               concerns=concerns, id_prefix="demo__"))
+    p = seen.get("prompt", "")
+    check("a concern on a type the unit mentions is kept",
+          "impl Task constructor" in p)
+    check("a concern on a type it never mentions is dropped",
+          "impl Drop for Workspace" not in p and "impl Activity constructor" not in p,
+          "unrelated prohibitions leaked into the prompt")
+    check("owning something is stated as mandatory",
+          "mandatory" in p.lower() or "OWNS" in p)
 
 
 if __name__ == "__main__":

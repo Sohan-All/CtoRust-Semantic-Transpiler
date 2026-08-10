@@ -25,6 +25,8 @@ the acceptance criteria.
 
 from __future__ import annotations
 
+import re
+
 
 from config import Config
 from llm import LLM
@@ -110,6 +112,12 @@ decision the implementer would otherwise have to guess:
   text->primitive parsing is a plain function. An `args: &[String]`
   parameter mirrors C argv: args[0] is the program path; real arguments
   (subcommands, flags) start at args[1].
+  A C function-pointer parameter STAYS a parameter: it becomes a generic
+  bounded by `Fn`/`FnMut`/`FnOnce` (the loosest bound the body needs — `FnMut`
+  if it is called in a loop). It is behavior the CALLER supplies, so it must
+  not become a free function, a `deps` stub, or a field, and it must not be
+  dropped from the signature. If a CALLBACK PARAMETERS block appears with this
+  unit, every parameter it names has to be present in your signature.
 - "ownership": one entry per parameter/return worth deciding: who owns it,
   borrowed or moved, lifetimes of returned references.
 - "error_mapping": for each failure the unit's invariants describe, which
@@ -198,7 +206,9 @@ FFI exports. C shapes never survive into signatures: comparator-returning-int
 defines, since the orphan rule makes `impl FromStr for i32` and
 `impl Display for String` impossible. Display/print/report behavior must
 guarantee emission: print directly, or note which caller prints the returned
-value — never a report nobody prints.
+value — never a report nobody prints. A C function-pointer parameter stays a
+parameter, as a generic bounded by `Fn`/`FnMut` — never a free function, a
+`deps` stub or a field, and never dropped from the signature.
 
 ONE exception to "C shapes never survive": a return value that reaches the
 process exit status (`main`, what `main` returns, anything feeding them) is
@@ -379,14 +389,44 @@ async def _generate_rich(llm: LLM, units: list[Explanation], types_rs: str,
     def owner_id(u: Explanation) -> str:
         return id_prefix + u.id
 
-    def assignments_for(uid: str) -> str:
+    def _relevant(concern: str, unit_text: str) -> bool:
+        """Does this unit plausibly touch the concern's subject?
+
+        Scoping the pass to the project made `owns` project-wide, which is the
+        point — but it made the PROHIBITION list project-wide too, and that was
+        not. Per-file it averaged 1.9 entries per unit; project-wide it averaged
+        17-29, so every unit carried ~25 "never implement these" lines naming
+        items in files it has nothing to do with. A unit's own assigned concern
+        then sat inside a wall of near-identical prohibitions.
+        `array_list base_srvB_t6` is where that showed: `project__exp_0001`
+        owned `impl Project constructor`, listed 29 prohibitions beside it, and
+        its repair deleted the constructor it owned.
+
+        So the obligation stays global and the prohibition is filtered to
+        concerns naming a type this unit's description actually mentions. That
+        keeps the cross-file duplicate the project scope exists to prevent —
+        two units cannot both work on a type only one of them mentions —
+        without burying the unit in irrelevant text.
+        """
+        types = re.findall(r"\b[A-Z][A-Za-z0-9_]{2,}\b", concern)
+        if not getattr(cfg, "rustgen_scoped_prohibitions", True):
+            return True          # ablation: broadcast every concern, as before
+        return not types or any(t in unit_text for t in types)
+
+    def assignments_for(uid: str, unit_text: str = "") -> str:
         owns = [c["concern"] for c in concerns if c["owner"] == uid]
         others = [f"{c['concern']} (owned by {c['owner']})"
-                  for c in concerns if c["owner"] != uid]
+                  for c in concerns
+                  if c["owner"] != uid and _relevant(c["concern"], unit_text)]
         lines = []
         lines.append("This unit OWNS: " + ("; ".join(owns) if owns else "(nothing shared)"))
+        if owns:
+            lines.append("Implementing what this unit OWNS is mandatory — no "
+                         "other unit will, and callers across the crate depend "
+                         "on it.")
         if others:
-            lines.append("Owned by OTHER units (never implement these): " + "; ".join(others))
+            lines.append("Owned by OTHER units (call them, never implement "
+                         "these): " + "; ".join(others))
         return "\n".join(lines)
 
     want_symbols = cfg.rustgen_symbol_map
@@ -394,7 +434,7 @@ async def _generate_rich(llm: LLM, units: list[Explanation], types_rs: str,
     async def spec(u: Explanation) -> tuple[str, dict]:
         r = await llm.ask_json(RICH_SPEC_PROMPT.format(
             types_rs=types_rs, glossary=glossary,
-            assignments=assignments_for(owner_id(u)),
+            assignments=assignments_for(owner_id(u), unit_block(u)),
             symbol_map_bullet=SYMBOL_MAP_BULLET if want_symbols else "",
             symbol_map_key=', "symbol_map": [...]' if want_symbols else "",
             unit=unit_block(u, extras.get(u.id, ""))),

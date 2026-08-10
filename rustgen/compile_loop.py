@@ -34,7 +34,8 @@ from config import Config
 from llm import LLM
 from state import Explanation
 from rustgen.common import (demote_dangling_docs, emptied_blocks, extract_rust,
-                            illegal_stubs, parse_regression, render_spec,
+                            illegal_stubs, illegal_type_bodies,
+                            lost_impl_methods, parse_regression, render_spec,
                             unit_block)
 
 SHARED = "__shared__"   # the types/deps region
@@ -676,7 +677,8 @@ def missing_capability_notes(errs: list[dict], sections_code: dict[str, str]) ->
     return "\n\n" + "\n".join(out)
 
 
-def _name_lookup(err: dict, sections_code: dict[str, str]) -> str | None:
+def _name_lookup(err: dict, sections_code: dict[str, str],
+                 owner_routing: bool = True) -> str | None:
     """For one-span name errors: which section defines, OR SHOULD DEFINE, the
     missing identifier?
 
@@ -701,6 +703,8 @@ def _name_lookup(err: dict, sections_code: dict[str, str]) -> str | None:
         for sid, code_str in sections_code.items():
             if pat.search(code_str):
                 return sid
+    if not owner_routing:      # ablation: cfg.rustgen_owner_routing
+        return None
     m = _RECEIVER.search(msg)
     if m:
         return _impl_owner(_base_type(m.group(1)), sections_code)
@@ -725,7 +729,8 @@ class _UnionFind:
 
 
 def route_errors(errors: list[dict], lib_rs: str,
-                 sections_code: dict[str, str]) -> list[tuple[frozenset, list[dict]]]:
+                 sections_code: dict[str, str],
+                 owner_routing: bool = True) -> list[tuple[frozenset, list[dict]]]:
     """Group errors into repair clusters. Returns [(sections, errors), ...]
     where singleton clusters take the single-repair tier and multi-section
     clusters take the joint tier."""
@@ -736,7 +741,7 @@ def route_errors(errors: list[dict], lib_rs: str,
     for e in errors:
         touched = {owner_of(l, index) for l in _all_span_lines(e)} or {SHARED}
         if len(touched) == 1:
-            other = _name_lookup(e, sections_code)
+            other = _name_lookup(e, sections_code, owner_routing)
             only = next(iter(touched))
             if other and other != only:
                 touched.add(other)
@@ -847,9 +852,36 @@ async def compile_loop(cfg: Config, llm: LLM, crate: Path,
         # cannot repair, and repairs produce them by deleting the item a doc
         # comment belonged to. Another check that was scoped to one writer.
         new_code = demote_dangling_docs(new_code)
-        prev = sections_code().get(sid, "")
+        all_secs = sections_code()
+        prev = all_secs.get(sid, "")
+        # `emptied_blocks` only catches a block emptied of EVERY item, so
+        # PARTIAL gutting walked straight through it — and that is what breaks
+        # runs. `array_list base_srvB_t6` returned `impl Project` with four of
+        # five methods intact and `new` dropped, same for `impl Task` keeping
+        # seven of eight; braces balanced, blocks non-empty, guard silent, and
+        # every caller then failed E0599 with the crate one error from done.
+        elsewhere = "\n".join(c for s, c in all_secs.items() if s != sid)
         problem = (parse_regression(prev, new_code)
-                   or emptied_blocks(prev, new_code))
+                   or emptied_blocks(prev, new_code)
+                   or lost_impl_methods(prev, new_code, elsewhere))
+        # The shared block holds TYPES. A repair that gives it a method body is
+        # writing behaviour a unit already owns, and Rust rejects two inherent
+        # methods of one name whatever their signatures (E0592). The loop then
+        # cannot undo its own damage: deleting the added method empties the
+        # impl block, which emptied_blocks correctly refuses.
+        #
+        # `binary_heap base_srvA_t5` is exactly this. Its stage-T types are
+        # clean — two project_types_all records exist and only the SECOND
+        # carries `fn spawn`, so the shared REPAIR introduced it, colliding
+        # with scheduler/exp_0003's real four-argument `spawn`. Errors went
+        # 3 -> 5 on the round that landed it, then 5 -> 5 -> 5 through six
+        # refused repairs. Gating stage T alone would not have caught this:
+        # same lesson as the brace check and the stub gate, a check scoped to
+        # one writer instead of every writer.
+        if not problem and sid == SHARED:
+            added = illegal_type_bodies(new_code)
+            if added and not illegal_type_bodies(prev):
+                problem = f"repair implements behaviour in the types block: {added}"
         if problem:
             report.rejected_repairs.append({"section": sid, "problem": problem})
             print(f"[compile] {sid}: repair REJECTED ({problem}) "
@@ -1058,7 +1090,8 @@ async def compile_loop(cfg: Config, llm: LLM, crate: Path,
                                   "reverted_to_errors": len(errors),
                                   "mode": "conservative"})
 
-        clusters = route_errors(errors, lib_rs, sections_code())
+        clusters = route_errors(errors, lib_rs, sections_code(),
+                                cfg.rustgen_owner_routing)
         dirty = {sid for secs, _ in clusters for sid in secs} if errors else set()
         report.rounds.append({
             "round": round_num,

@@ -978,6 +978,76 @@ def test_missing_item_routes_to_owner() -> None:
           "inline" in note_std, note_std[:90])
 
 
+def test_illegal_type_bodies() -> None:
+    """The types block must not implement behaviour a unit will also write.
+
+    `illegal_stubs` does NOT cover this: it only catches `todo!()` bodies, so a
+    REAL method body in the types block passed every gate. Rust then rejects
+    two inherent methods of one name whatever their signatures (E0592), and the
+    compile loop cannot undo it — deleting the added method empties the impl
+    block, which `emptied_blocks` correctly refuses.
+    """
+    print("\n=== types block implements no behaviour ===")
+    from rustgen.common import illegal_type_bodies as chk
+
+    cases = [
+        ("the real binary_heap t5 body",
+         "impl Scheduler {\n fn spawn(&mut self, t: T) -> R {\n  self.tasks.push(t); Ok(())\n }\n}", True),
+        ("required Display impl is permitted",
+         "impl std::fmt::Display for E {\n fn fmt(&self, f: &mut F) -> R { write!(f, \"x\") }\n}", False),
+        ("required Error impl is permitted",
+         "impl std::error::Error for E {\n fn source(&self) -> O { None }\n}", False),
+        ("a deps-module stub is permitted",
+         "pub mod x_deps {\n pub fn cb<T>(i: T) -> R { Ok(()) }\n}", False),
+        ("a todo!() body is illegal_stubs' verdict, not this one",
+         "impl S {\n fn f(&self) { todo!() }\n}", False),
+        ("plain type definitions are clean",
+         "#[derive(Debug)]\npub struct S { pub a: i32 }\npub enum E { A }", False),
+        ("an empty body implements nothing",
+         "impl S {\n fn f(&self) {}\n}", False),
+        ("a non-Display/Error trait impl IS behaviour",
+         "impl Ord for S {\n fn cmp(&self, o: &S) -> O { self.a.cmp(&o.a) }\n}", True),
+    ]
+    for label, code, want in cases:
+        check(label, bool(chk(code)) == want, f"flagged={bool(chk(code))}")
+
+    # Known-bad AND known-good against the recorded corpus: the rate matters,
+    # because a checker that fires on a third of all types blocks is noise.
+    import json, glob
+    flagged = total = 0
+    for f in glob.glob("/nobackup2/alleshwaram/mtu_runs/abl2/runs/*/"
+                       "_project_B03_organic/files/*/state.jsonl"):
+        for line in open(f):
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            if d.get("type") != "rust_types":
+                continue
+            total += 1
+            if chk(d.get("types_rs", "")):
+                flagged += 1
+    if total:
+        rate = flagged / total
+        check(f"corpus rate stays low ({flagged}/{total} = {rate:.1%})",
+              rate < 0.10, f"{rate:.1%}")
+
+    # The motivating run's OWN stage-T output is clean — the body came from a
+    # shared REPAIR, which is why gating stage T alone would not have caught
+    # it and set_section carries the same check.
+    recs = [json.loads(l) for l in open(
+        "/nobackup2/alleshwaram/mtu_runs/abl2/runs/binary_heap_base_srvA_t5/"
+        "_project_B03_organic/project.jsonl")]
+    pt = [r for r in recs if r.get("type") == "project_types_all"]
+    if len(pt) >= 2:
+        check("the shared block was clean before the repair",
+              not chk(pt[0]["types_rs"]), chk(pt[0]["types_rs"])[:60])
+        check("...and carries an implemented body after it",
+              bool(chk(pt[-1]["types_rs"])))
+        check("so the set_section guard would reject that write",
+              bool(chk(pt[-1]["types_rs"])) and not bool(chk(pt[0]["types_rs"])))
+
+
 def main() -> int:
     test_gather_units_survives()
     test_on_result_fires_before_later_failure()
@@ -1004,6 +1074,7 @@ def main() -> int:
     test_orphan_rule_in_prompts()
     test_one_call_is_bounded()
     test_missing_item_routes_to_owner()
+    test_illegal_type_bodies()
     print()
     if _failures:
         print(f"{len(_failures)} FAILURE(S):")

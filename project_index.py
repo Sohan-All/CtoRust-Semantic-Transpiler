@@ -199,8 +199,18 @@ def build_index(c_root: Path, split_over: int = 40) -> ProjectIndex:
     references: dict[str, set[str]] = {}
     rel = {p: str(p.relative_to(c_root)) for p in c_files}
 
+    # Callback PARAMETERS must not become cross-file "references": a name like
+    # `compare_func` is supplied by the caller, and treating it as a reference
+    # to a missing function distorts the caller map every consumer reads.
+    # Typedefs come from headers, which is where all five projects that use the
+    # `ArrayListCompareFunc cmp` form declare them.
+    from chunker import fn_pointer_typedefs
+    fn_ptr_types = frozenset().union(*(
+        fn_pointer_typedefs(p.read_text(errors="replace"))
+        for p in (h_files + c_files)), set()) if (h_files or c_files) else frozenset()
+
     for p in c_files:
-        graph = chunk(p.read_text(), split_over)
+        graph = chunk(p.read_text(), split_over, fn_ptr_types=fn_ptr_types)
         refs: set[str] = set()
         for b in graph.blocks:
             # a block carries .function iff it belongs to a definition —
