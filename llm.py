@@ -158,6 +158,9 @@ class LLM:
         self.input_tokens = 0
         self.output_tokens = 0
         self.transport_retries = 0   # observability: how flaky was this run
+        # Replies that parsed but omitted a `required` field. Only reachable
+        # when the schema is advisory rather than enforced — see ask_json.
+        self.schema_violations = 0
 
     MAX_TOKENS_CEILING = 16000
     MIN_TOKENS_FLOOR = 512  # below this a context-length clamp gives up
@@ -380,17 +383,59 @@ class LLM:
         malformed reply is expensive: an unparseable stage-S spec used to take
         down a whole project run through asyncio.gather, having already burnt
         the retries below. The retry path stays as a backstop for servers that
-        do not support structured outputs."""
+        do not support structured outputs.
+
+        TWO failure modes, retried separately, because they are not the same
+        failure. Unparseable output is caught by `extract_json`. Output that
+        parses but omits a `required` field is caught by `missing_required` —
+        which matters only where the schema is ADVISORY: under vLLM's grammar
+        conformance is structural and this can never fire, but Vertex blocks
+        `structured_outputs` by org policy (see `_ask_anthropic`), so there the
+        schema is a sentence in the prompt and nothing enforces it. Measured
+        2026-08-11 on Vertex, 3 draws per model: a two-required-field schema
+        came back missing one on **6 of 6 first attempts**, each substituting a
+        near-miss name (`reason`, `reasoning`) — the same shape as the
+        flat-schema bug in TRIALS.md. Systematic, not a bad draw. All 6
+        recovered on exactly ONE retry, so the check costs one extra call per
+        `ask_json` on this backend and nothing at all on vLLM, where the
+        grammar means the first attempt already conforms.
+
+        A still-nonconforming reply is RETURNED, not raised. Every consumer
+        reads these with `.get()`, so a missing field degrades to a default and
+        the downstream gate refuses the work correctly; raising instead would
+        convert a soft, already-safe degradation into a dead run. It is counted
+        into `schema_violations` and printed, because surviving a failure must
+        not make the failure invisible."""
         last_err = None
-        for _ in range(retries + 1):
+        obj = _UNSET = object()
+        for attempt in range(retries + 1):
             text = await self.ask(prompt, system=system, max_tokens=max_tokens,
                                   schema=schema)
             try:
-                return extract_json(text)
+                obj = extract_json(text)
             except ValueError as e:
                 last_err = e
                 prompt = (prompt + "\n\nYour previous reply was not valid JSON "
                           f"({e}). Reply with ONLY the JSON, no prose, no fences.")
+                continue
+            missing = missing_required(obj, schema)
+            if not missing:
+                return obj
+            if attempt < retries:
+                # Name the fields. The generic "that was not valid JSON" note
+                # is useless here — the reply WAS valid JSON, and a model told
+                # only that it was wrong tends to reword the same object.
+                prompt = (prompt + "\n\nYour previous reply was valid JSON but "
+                          f"omitted required field(s): {', '.join(missing)}. "
+                          "Reply with ONLY the JSON, including every required "
+                          "field, using exactly these names.")
+        if obj is not _UNSET:
+            self.schema_violations += 1
+            print(f"[llm] reply still missing required field(s) "
+                  f"{', '.join(missing_required(obj, schema))} after "
+                  f"{retries} retries — returning it; consumers read with "
+                  f".get() and the downstream gate decides")
+            return obj
         raise ValueError(f"no valid JSON after retries: {last_err}")
 
     def usage_record(self) -> dict:
@@ -400,7 +445,27 @@ class LLM:
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
             "transport_retries": self.transport_retries,
+            "schema_violations": self.schema_violations,
         }
+
+
+def missing_required(obj, schema: dict | None) -> list[str]:
+    """Top-level `required` keys absent from `obj`, in schema order.
+
+    Top-level only, deliberately: that is the whole of what this pipeline's
+    schemas assert, and it is the level the grammar used to guarantee. A
+    schema's `required` list is the only thing actually required — an optional
+    field will simply be omitted, and treating that as a violation would make
+    every well-formed reply look broken.
+
+    Returns [] for anything it cannot judge (no schema, no `required`, or a
+    reply that is not an object), so a caller can use it unconditionally."""
+    if not isinstance(schema, dict) or not isinstance(obj, dict):
+        return []
+    req = schema.get("required")
+    if not isinstance(req, list):
+        return []
+    return [k for k in req if isinstance(k, str) and k not in obj]
 
 
 def extract_json(text: str):
