@@ -25,6 +25,7 @@ import dataclasses
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -34,6 +35,9 @@ from pathlib import Path
 from config import Config, CONFIG_ENV_VAR, load_config
 from llm import LLM
 from project_index import ProjectIndex, build_index
+from rustgen.escalation import (Escalation, compile_outcome,
+                                enabled_sites, over_budget,
+                                should_escalate_compile)
 from state import Store
 
 ROOT = Path(__file__).parent
@@ -138,7 +142,7 @@ async def phase_types(c_root: Path, idx: ProjectIndex) -> tuple[str, dict]:
 
     base = load_config()
     cfg = dataclasses.replace(base, worker_model=base.rustgen_model)
-    llm = LLM(cfg)
+    llm = LLM(cfg, role="rustgen")
     shared_rs, glossary = await synthesize_project_types(
         llm, idx, descriptions, cfg.rustgen_types_max_tokens)
     pdir = project_dir(c_root)
@@ -151,6 +155,51 @@ async def phase_types(c_root: Path, idx: ProjectIndex) -> tuple[str, dict]:
     return shared_rs, glossary
 
 
+async def _agent_stub_firing(cfg, esc_llm, sections: dict, open_stubs, *,
+                             crate: Path, c_root: Path, shared_id: str,
+                             compile_check) -> tuple[dict, dict]:
+    """One agent firing against the stub residue (plan.md item 6, site C).
+
+    Owns the staged root's whole lifetime, in a `finally`, because the staged
+    tree is a COPY of the crate and the C source and leaving one behind per
+    firing fills a scratch disk over a batch. The containment check runs inside
+    `stage()`; if it raises, this returns a refusal record rather than killing
+    the run — a firing that could not be set up safely is a firing that did not
+    happen, and the record says so.
+    """
+    import shutil
+    import tempfile
+    from rustgen.agent import AgentBudget, StagedRootError
+    from rustgen.agent_sites import agent_clear_stubs, stage_for_run
+
+    tmp = Path(tempfile.mkdtemp(prefix="mtu_agent_"))
+    try:
+        try:
+            staged = stage_for_run(
+                tmp / "root", crate, c_root,
+                include_pipeline=getattr(
+                    cfg, "escalation_agent_reads_pipeline", True),
+                label="stubs")
+        except StagedRootError as e:
+            print(f"[escalation] stubs: agent NOT run — {e}")
+            return sections, {"type": "agent_site", "site": "stubs",
+                              "accepted": False, "outcome": "staging_refused",
+                              "problem": str(e)}
+        budget = AgentBudget(
+            max_turns=getattr(cfg, "escalation_max_turns", 6),
+            max_tool_calls=getattr(cfg, "escalation_agent_max_tool_calls", 40),
+            wall_seconds=getattr(cfg, "escalation_agent_wall_seconds", 600.0))
+        sections2, record = await agent_clear_stubs(
+            esc_llm, sections, open_stubs,
+            staged=staged, shared_id=shared_id,
+            compile_check=compile_check, budget=budget,
+            max_tokens=getattr(cfg, "escalation_max_tokens", 4000) * 2)
+        print(f"[escalation] stubs: agent {record.get('outcome', '?')} "
+              f"({record.get('agent', {}).get('turns', 0)} turn(s), "
+              f"{record.get('agent', {}).get('tool_calls', 0)} tool call(s))")
+        return sections2, record
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 async def phase_rustgen(c_root: Path, idx: ProjectIndex) -> None:
@@ -177,7 +226,7 @@ async def phase_rustgen(c_root: Path, idx: ProjectIndex) -> None:
 
     base = load_config()
     cfg = dataclasses.replace(base, worker_model=base.rustgen_model)
-    llm = LLM(cfg)
+    llm = LLM(cfg, role="rustgen")
 
     # entry function: the file defining C main is the binary wrapper's
     # target; its MTU code is generated like any other unit
@@ -198,6 +247,50 @@ async def phase_rustgen(c_root: Path, idx: ProjectIndex) -> None:
     # block is a save, and putting it in the degraded list made the run
     # unscoreable for having been fixed.
     repairs: list[dict] = []
+    # plan.md site A. One escalation LLM for the whole run, so `Escalation`'s
+    # per-firing deltas are the only way to attribute cost to a firing — and a
+    # separate instance from `llm` so `usage_record()` splits cheap from
+    # expensive, which is the entire point of the metering.
+    escalations: list[dict] = []
+    tdrafts: list[dict] = []          # rejected stage-T drafts, for auditing
+    esc_sites = enabled_sites(cfg)
+    esc_llm = None
+    if esc_sites:
+        esc_llm = LLM(dataclasses.replace(cfg,
+                                          worker_model=cfg.escalation_model),
+                      role="escalation")
+        print(f"[escalation] {cfg.escalation_model} enabled for: "
+              f"{', '.join(esc_sites)}")
+
+    _budget_reported: set[str] = set()
+
+    def _budget_stop(site: str) -> bool:
+        """Refuse a firing once the run's escalation budget is gone, and SAY SO.
+
+        A budget that stops spending silently is indistinguishable from a site
+        that had nothing to do — and those call for opposite responses, so the
+        skip is printed and recorded.
+
+        Recorded ONCE per site: stage T is consulted per FILE, so an 11-file
+        project over budget would otherwise write 11 identical refusals and
+        make the firing count unreadable.
+        """
+        if not over_budget(escalations, cfg):
+            return False
+        if site in _budget_reported:
+            return True
+        _budget_reported.add(site)
+        spent = sum(e.get("input_tokens", 0) + e.get("output_tokens", 0)
+                    for e in escalations)
+        print(f"[escalation] {site}: SKIPPED — run budget spent "
+              f"({spent}/{cfg.escalation_run_token_budget} tokens)")
+        escalations.append({"type": "escalation", "site": site,
+                            "trigger": "budget_exhausted", "trigger_value": spent,
+                            "model": cfg.escalation_model, "accepted": False,
+                            "rejected_by": "run token budget exhausted",
+                            "error": "", "seconds": 0.0, "calls": 0,
+                            "input_tokens": 0, "output_tokens": 0})
+        return True
 
     xcalls = project_call_texts(c_root, idx, cfg.split_function_over_lines)
     xstatus = (project_exit_status(c_root, idx) if cfg.rustgen_exit_status
@@ -302,6 +395,23 @@ async def phase_rustgen(c_root: Path, idx: ProjectIndex) -> None:
                 callback_names=file_callback_names(c_root, fname, xfnptr,
                                                    cfg.split_function_over_lines),
                 repair=getattr(cfg, "rustgen_types_repair", True),
+                # site A: tried only after the local repair fails
+                escalation_llm=(esc_llm if ("types" in esc_sites
+                                            and not _budget_stop("types"))
+                                else None),
+                escalation_rounds=cfg.escalation_max_turns,
+                escalations=escalations,
+                drafts=tdrafts,
+                # plan.md item 6. Swaps site A's proposer for a read agent; the
+                # acceptance path and every gate are unchanged.
+                agent=getattr(cfg, "escalation_agent", False),
+                agent_c_root=c_root,
+                agent_reads_pipeline=getattr(
+                    cfg, "escalation_agent_reads_pipeline", True),
+                agent_max_tool_calls=getattr(
+                    cfg, "escalation_agent_max_tool_calls", 40),
+                agent_wall_seconds=getattr(
+                    cfg, "escalation_agent_wall_seconds", 600.0),
                 # the repair compiles its candidate against the shared types
                 # this file was written against, so a legitimate cross-file
                 # reference is not charged to the repair as a new error
@@ -474,6 +584,111 @@ async def phase_rustgen(c_root: Path, idx: ProjectIndex) -> None:
             cfg, llm, crate, all_units, all_specs, types_all, all_code,
             reassemble, "")
 
+        # SITE B (plan.md). A run that finished its rounds still above zero,
+        # with FEW enough errors to be a repair rather than a rewrite.
+        #
+        # The threshold is not a guess: swept over 140 recorded per-run logs
+        # (mtu_runs/abl2/sweep_finals.py), 18 of 37 build failures sit at
+        # exactly `final: 1` and 25 at <= 3, while the tail runs
+        # 10/19/19/24/34. Buying a rewrite from an expensive model defeats the
+        # point of a cheap pipeline; buying one error's worth of repair does
+        # not. Best economics of the three sites, because cargo is a free,
+        # objective, immediate oracle — success is knowable before committing.
+        #
+        # Re-ENTERING compile_loop rather than writing a bespoke repair path is
+        # deliberate: every guard already lives inside it (`set_section` as the
+        # single write point, `emptied_blocks`, `lost_impl_methods`,
+        # `parse_regression`, best-tracking and revert). A separate escalated
+        # path would have to re-earn all of them.
+        if (should_escalate_compile(cfg, esc_sites, report.final_errors)
+                and not _budget_stop("compile")):
+            esc = Escalation("compile", esc_llm, trigger="final_errors",
+                             value=report.final_errors)
+            before = report.final_errors
+            improved = False
+            _agent_tmp, _staged, _abudget, _arecs = None, None, None, []
+            try:
+                with esc:
+                    ecfg = dataclasses.replace(
+                        cfg, rustgen_compile_rounds=cfg.escalation_max_turns)
+                    # plan.md item 6, site B. Swaps the CLUSTER tier only — the
+                    # multi-section one, and the one that could previously land
+                    # a cross-section change half-applied. Staging failure is a
+                    # firing that falls back to the ordinary escalated loop
+                    # rather than one that kills the run.
+                    if getattr(cfg, "escalation_agent", False):
+                        import tempfile
+                        from rustgen.agent import AgentBudget, StagedRootError
+                        from rustgen.agent_sites import stage_for_run
+                        try:
+                            _agent_tmp = Path(tempfile.mkdtemp(
+                                prefix="mtu_agent_compile_"))
+                            _staged = stage_for_run(
+                                _agent_tmp / "root", crate, c_root,
+                                include_pipeline=getattr(
+                                    cfg, "escalation_agent_reads_pipeline", True),
+                                label="compile")
+                            _abudget = AgentBudget(
+                                max_turns=cfg.escalation_max_turns,
+                                max_tool_calls=getattr(
+                                    cfg, "escalation_agent_max_tool_calls", 40),
+                                wall_seconds=getattr(
+                                    cfg, "escalation_agent_wall_seconds", 600.0))
+                        except StagedRootError as e:
+                            print(f"[escalation] compile: agent NOT run — {e}")
+                            _staged, _abudget = None, None
+                    t2, c2, _, rep2 = await compile_loop(
+                        ecfg, esc_llm, crate, all_units, all_specs,
+                        types_all, all_code, reassemble, "",
+                        agent_staged=_staged, agent_budget=_abudget,
+                        agent_records=_arecs)
+                    # TWO different questions, and conflating them overstates
+                    # the thing this work is judged on.
+                    #   improved — is the crate closer? then KEEP it; the loop's
+                    #              own best-tracking guarantees it is not worse.
+                    #   resolved — did the VERDICT change? Only `final: 0` does.
+                    # A crate at 1 error and one at 3 both score BUILD_FAILED,
+                    # so `3 -> 1` bought nothing, and recording it as accepted
+                    # would inflate the accept rate with firings that changed
+                    # no outcome. Same step function as site C's `after == 0`,
+                    # for the same reason, and observed live on the very first
+                    # multi-site run (`3 -> 1`, still BUILD_FAILED).
+                    improved, resolved = compile_outcome(
+                        before, rep2.final_errors)
+                    esc.done(accepted=resolved,
+                             rejected_by=("" if resolved else
+                                          f"{before} -> {rep2.final_errors}, "
+                                          f"still failing"))
+                if improved:
+                    types_all, all_code, report = t2, c2, rep2
+                    print(f"[escalation] compile: {before} -> "
+                          f"{rep2.final_errors} error(s)"
+                          + ("" if resolved else
+                             " — kept, but the crate still does NOT build"))
+                else:
+                    print(f"[escalation] compile: no improvement "
+                          f"({before} -> {rep2.final_errors}), reverted")
+            except Exception as ex:
+                print(f"[escalation] compile raised: "
+                      f"{type(ex).__name__}: {ex}")
+            finally:
+                escalations.append(esc.record)
+                # Every agent firing inside the loop, accepted or refused. A
+                # refused transaction is invisible otherwise, and "the agent
+                # proposed nothing" and "the agent proposed something the gate
+                # refused" are different facts calling for opposite responses.
+                for _r in _arecs:
+                    _record(pdir, _r)
+                if _agent_tmp is not None:
+                    shutil.rmtree(_agent_tmp, ignore_errors=True)
+                # UNCONDITIONAL, and the reason is the stub loop's scar: the
+                # escalated loop reassembles lib.rs on disk to test each
+                # candidate, so after a REJECTED attempt the crate on disk
+                # holds the rejected version. Rebuilding only on success would
+                # ship exactly the code that was just refused. `types_all` /
+                # `all_code` are the accepted state either way.
+                reassemble(types_all, all_code, "")
+
         # Stub repair runs HERE, after the compile loop, not before it. The
         # compile loop is a net stub PRODUCER — across every recorded run,
         # repairs introduced a stub 13 times and removed one 6 times — so a
@@ -481,7 +696,8 @@ async def phase_rustgen(c_root: Path, idx: ProjectIndex) -> None:
         # cover every writer" rule applied to the last writer in the chain.
         if getattr(cfg, "rustgen_stub_repair", True):
             from rustgen.stub_repair import (StubContext, SHARED_ID,
-                                             repair_stubs)
+                                             find_open_stubs, repair_stubs,
+                                             should_escalate_stubs)
             from rustgen.compile_loop import cargo_check
 
             # BASELINE FIRST. The check must reject only what the patch made
@@ -536,6 +752,87 @@ async def phase_rustgen(c_root: Path, idx: ProjectIndex) -> None:
                                "errored": sreport.errored,
                                "skipped_shared": sreport.skipped_shared,
                                "details": sreport.details})
+
+            # SITE C (plan.md). The residue, escalated as a SET.
+            #
+            # All-or-nothing by design: `remaining_stubs` voids a crate for one
+            # stub, so clearing four of five buys nothing — `cc_array base`
+            # cleared 5 and stayed STUB_CRATE in all 6 runs. `should_escalate_
+            # stubs` therefore refuses to spend at all when any residual stub
+            # has no call site anywhere, which is the class-7 case no model can
+            # answer without inventing.
+            #
+            # Re-entering `repair_stubs` keeps the tier discipline intact: a
+            # tier-2 patch with no cited evidence is still REFUSED, and that
+            # matters MORE here, not less — a type-correct wrong callback from
+            # a stronger model is more plausible and compiles just as clean.
+            if "stubs" in esc_sites and not _budget_stop("stubs"):
+                fire, why_not = should_escalate_stubs(
+                    sections, ctx, shared_id=SHARED_ID)
+                if not fire:
+                    if "no patchable stubs" not in why_not:
+                        print(f"[escalation] stubs: skipped — {why_not}")
+                else:
+                    open_stubs = [s for s in find_open_stubs(
+                        sections, SHARED_ID) if s.patchable]
+                    before = len(open_stubs)
+                    esc = Escalation("stubs", esc_llm,
+                                     trigger="stubs_remaining", value=before)
+                    try:
+                        with esc:
+                            if getattr(cfg, "escalation_agent", False):
+                                # AGENT PATH (plan.md item 6). Same trigger,
+                                # same acceptance rule, wider read and a
+                                # transaction-scoped write. The question-menu
+                                # loop below stays the default until the agent
+                                # arm is measured against it.
+                                sections2, arec = await _agent_stub_firing(
+                                    cfg, esc_llm, sections, open_stubs,
+                                    crate=crate, c_root=c_root,
+                                    shared_id=SHARED_ID,
+                                    compile_check=_compile_check)
+                                _record(pdir, arec)
+                            else:
+                                sections2, sreport2 = await repair_stubs(
+                                    esc_llm, sections, all_units, ctx,
+                                    shared_id=SHARED_ID,
+                                    compile_check=_compile_check,
+                                    max_tokens=cfg.escalation_max_tokens,
+                                    rounds=cfg.escalation_max_turns)
+                                # The escalated pass's report was computed and
+                                # DISCARDED for the whole first batch, which is
+                                # why "which 2 of the 7 cleared" had to be
+                                # re-derived with cargo. A surviving failure
+                                # must not be an invisible one.
+                                _record(pdir, {
+                                    "type": "event",
+                                    "event": "stub_repair_escalated",
+                                    "considered": sreport2.considered,
+                                    "resolved": sreport2.resolved,
+                                    "gave_up": sreport2.gave_up,
+                                    "rejected": sreport2.rejected,
+                                    "errored": sreport2.errored,
+                                    "skipped_shared": sreport2.skipped_shared,
+                                    "details": sreport2.details})
+                            after = len([s for s in find_open_stubs(
+                                sections2, SHARED_ID) if s.patchable])
+                            # CLEARED, not merely fewer. A crate with one stub
+                            # left scores exactly as badly as one with six.
+                            ok = after == 0
+                            esc.done(accepted=ok,
+                                     rejected_by=("" if ok else
+                                                  f"{before} -> {after} stub(s)"))
+                        if ok:
+                            sections = sections2
+                            print(f"[escalation] stubs: cleared all {before}")
+                        else:
+                            print(f"[escalation] stubs: {before} -> {after}, "
+                                  f"still stubbed — reverted")
+                    except Exception as ex:
+                        print(f"[escalation] stubs raised: "
+                              f"{type(ex).__name__}: {ex}")
+                    finally:
+                        escalations.append(esc.record)
             # UNCONDITIONAL. `_compile_check` reassembles the crate on disk to
             # test a candidate, so after a REJECTED patch lib.rs still holds
             # it. Rebuilding only `if sreport.resolved` would ship that
@@ -579,6 +876,19 @@ async def phase_rustgen(c_root: Path, idx: ProjectIndex) -> None:
                        "hints": sem.hints, "total": sem.total})
         print(f"[semantic] project: {sem.summary()}")
     _record(pdir, llm.usage_record())
+    # A SECOND usage record, for the escalation model. Written whenever the
+    # instance exists, even at zero calls: "escalation was configured and never
+    # fired" and "escalation was never configured" are different facts about a
+    # run, and the summary can only tell them apart if the record is there.
+    if esc_llm is not None:
+        _record(pdir, esc_llm.usage_record())
+    for e in escalations:
+        _record(pdir, e)
+    # Rejected stage-T drafts. Only written when there ARE any — an absent
+    # record means the gates never rejected a draft, which is the common case.
+    if tdrafts:
+        _record(pdir, {"type": "types_drafts", "count": len(tdrafts),
+                       "drafts": tdrafts})
 
     # Last, so it covers every stage above. Written only when something was
     # actually lost — an absent record means a clean run, which is what the

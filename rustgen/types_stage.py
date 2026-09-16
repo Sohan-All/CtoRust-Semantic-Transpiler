@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 
 from llm import LLM, extract_json
+from rustgen.escalation import Escalation
 from state import Explanation
 from rustgen.common import (extract_rust, illegal_stubs, illegal_type_bodies,
                             stubbed_callbacks, unit_block)
@@ -19,6 +20,9 @@ from rustgen.common import (extract_rust, illegal_stubs, illegal_type_bodies,
 # synthesize_types). Same budget as stage C's pre-flight, for the same reason:
 # a fresh draw usually fixes it and the call is not cheap.
 TYPES_RETRIES = 2
+# Only a fallback for callers that do not pass one; run_project always
+# passes cfg.escalation_max_turns. Matches types_repair.REPAIR_ROUNDS.
+REPAIR_TURNS_DEFAULT = 4
 
 STUB_RETRY_NOTE = """\
 Your previous reply is rejected: {problem}.
@@ -136,7 +140,16 @@ async def synthesize_types(llm: LLM, units: list[Explanation],
                            repair: bool = True,
                            context_rs: str = "",
                            c_source: str = "",
-                           callback_names: frozenset[str] = frozenset()
+                           callback_names: frozenset[str] = frozenset(),
+                           escalation_llm=None,
+                           escalations: list[dict] | None = None,
+                           escalation_rounds: int = REPAIR_TURNS_DEFAULT,
+                           drafts: list[dict] | None = None,
+                           agent: bool = False,
+                           agent_c_root=None,
+                           agent_reads_pipeline: bool = True,
+                           agent_max_tool_calls: int = 40,
+                           agent_wall_seconds: float = 600.0,
                            ) -> tuple[str, dict]:
     """`project_block` (multi-file translation): shared project types +
     sibling-function notice, prepended as fixed context — this file's Stage T
@@ -151,6 +164,22 @@ async def synthesize_types(llm: LLM, units: list[Explanation],
     `notes` receives a record when the repair SUCCEEDS — a separate list from
     `failures` on purpose, because `failures` is the caller's degraded list and
     anything in it voids the run. A rescued block is the opposite of a loss.
+
+    `escalation_llm` (plan.md site A) is a STRONGER model, tried only after the
+    local repair has failed. Cheapest possible placement for the most leverage
+    in the pipeline: one block per project rather than one per unit, upstream of
+    every unit so a fix propagates to all of them, and validated the same way —
+    the candidate has to survive `validate_repair` and the gates below. On any
+    failure the original block comes back and this branch proceeds exactly as it
+    did before, so escalation cannot make a good run worse either. Records land
+    in `escalations`, accepted or not: a firing that vanishes looks identical to
+    one that never happened, except that it was paid for.
+
+    `drafts` receives every REJECTED draft (attempt, the gate's complaint, the
+    block). Previously only the final `project_types_all` was stored, so a
+    gate-voided run could not be audited at all — and the two recorded repair
+    notes both claim the gate rejected a `deps`-module stub it should permit,
+    which is exactly the claim these drafts make checkable.
 
     `failures` receives a record when the stub gate exhausts its retries. That
     outcome is not survivable in practice and used to be a printed warning the
@@ -202,6 +231,13 @@ async def synthesize_types(llm: LLM, units: list[Explanation],
                    or illegal_stubs(types_rs) or illegal_type_bodies(types_rs))
         if not problem:
             break
+        # Persist the rejected draft BEFORE re-prompting. Without this a
+        # gate-voided run keeps only the final draw, so the one question worth
+        # asking afterwards — what exactly did the gate object to, and was it
+        # right — cannot be asked at all.
+        if drafts is not None:
+            drafts.append({"attempt": attempt, "problem": problem,
+                           "block": types_rs})
         note = (CALLBACK_RETRY_NOTE if "CALLBACK" in problem else
                 STUB_RETRY_NOTE if "stub" in problem else BODY_RETRY_NOTE)
         if attempt < TYPES_RETRIES:
@@ -215,16 +251,27 @@ async def synthesize_types(llm: LLM, units: list[Explanation],
         # and its output has to survive four checks including a real cargo
         # check. It cannot make a good block worse: on any failure the original
         # comes back and this branch proceeds exactly as it did before.
-        if repair:
-            from rustgen.types_repair import repair_types_block
-            repaired, rep = await repair_types_block(
-                llm, types_rs, problem, units,
-                context_rs=context_rs, c_source=c_source,
-                max_tokens=max_tokens)
+        # ONE attempt, driven by either model. Factored rather than copied
+        # because the acceptance path is the load-bearing part — re-running the
+        # gates on the candidate, and routing a success to `notes` and never to
+        # `failures` — and a second hand-written copy of it for the escalated
+        # attempt is precisely how the two drift.
+        def _accept(repaired, rep, label: str):
+            """The acceptance half of an attempt, shared by every proposer.
+
+            Factored out when the agent path landed at site A, for the reason
+            the comment above already gives: this is the load-bearing part, and
+            a second hand-written copy of it is how the two drift. The agent
+            path differs ONLY in how the candidate was produced — the gates it
+            must survive and the notes-not-failures routing are identical, and
+            no gate relaxes because the proposer got stronger.
+            """
+            nonlocal problem
             if rep.get("repaired"):
                 fixed = illegal_stubs(repaired) or illegal_type_bodies(repaired)
                 if not fixed:
-                    print(f"[types] repaired after {rep['rounds']} round(s) "
+                    print(f"[types] {label} repair succeeded after "
+                          f"{rep['rounds']} round(s) "
                           f"(asked: {', '.join(rep['questions']) or 'nothing'})")
                     # A SUCCESS goes to `notes`, never to `failures`. This
                     # record used to land in `failures`, which is the degraded
@@ -240,15 +287,103 @@ async def synthesize_types(llm: LLM, units: list[Explanation],
                         notes.append({"stage": "types",
                                       "unit": "(shared types)",
                                       "repaired": True,
+                                      "by": label,
                                       "rounds": rep["rounds"],
                                       "questions": rep.get("questions", []),
                                       "note": f"types repair: {rep['why']}"})
-                    return repaired, glossary if isinstance(glossary, dict) else {}
+                    return repaired, rep
                 # a repair that passed validate_repair but not the gates should
                 # be impossible; if it happens, keep the original and say so
                 problem = fixed
-            print(f"[types] repair did not resolve it "
+            print(f"[types] {label} repair did not resolve it "
                   f"({rep.get('action')}: {rep.get('why') or '-'})")
+            return None, rep
+
+        async def _attempt(rllm, label: str, rounds: int | None = None):
+            from rustgen.types_repair import repair_types_block, REPAIR_ROUNDS
+            repaired, rep = await repair_types_block(
+                rllm, types_rs, problem, units,
+                context_rs=context_rs, c_source=c_source,
+                max_tokens=max_tokens,
+                rounds=REPAIR_ROUNDS if rounds is None else rounds)
+            return _accept(repaired, rep, label)
+
+        async def _agent_attempt(rllm, label: str, rounds: int | None = None):
+            """SITE A's agent path (plan.md item 6). Same acceptance, same
+            gates; only the proposer's read surface changes.
+
+            Owns its staged root's whole lifetime in a `finally` — the tree is a
+            copy, and one left behind per firing fills a scratch disk over a
+            batch. A staging failure is a firing that did not happen, and is
+            recorded as such rather than killing an already-failing stage.
+            """
+            import shutil
+            import tempfile
+            from pathlib import Path
+            from rustgen.agent import AgentBudget, StagedRootError
+            from rustgen.agent_sites import agent_repair_types, stage_for_types
+
+            if agent_c_root is None:
+                return None, {"action": "give_up", "repaired": False,
+                              "why": "no c_root available to stage"}
+            tmp = Path(tempfile.mkdtemp(prefix="mtu_agent_types_"))
+            try:
+                try:
+                    staged = stage_for_types(
+                        tmp / "root", agent_c_root,
+                        include_pipeline=agent_reads_pipeline)
+                except StagedRootError as e:
+                    print(f"[types] agent NOT run — {e}")
+                    return None, {"action": "give_up", "repaired": False,
+                                  "why": f"staging refused: {e}"}
+                repaired, rep = await agent_repair_types(
+                    rllm, types_rs, problem, staged=staged, drafts=drafts,
+                    context_rs=context_rs,
+                    budget=AgentBudget(
+                        max_turns=rounds or REPAIR_TURNS_DEFAULT,
+                        max_tool_calls=agent_max_tool_calls,
+                        wall_seconds=agent_wall_seconds),
+                    max_tokens=max_tokens * 2)
+                return _accept(repaired, rep, label)
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+
+        if repair:
+            block, _ = await _attempt(llm, "local")
+            if block is not None:
+                return block, glossary if isinstance(glossary, dict) else {}
+
+            # SITE A. Only after the local repair has failed, so the cheap
+            # model is always tried first and escalation is charged only for
+            # what it actually rescues.
+            if escalation_llm is not None:
+                esc = Escalation("types", escalation_llm,
+                                 trigger="gate_exhausted", value=problem[:120])
+                block = None
+                # The agent path swaps the PROPOSER, never the acceptance. Both
+                # branches end in `_accept`, so a candidate from either has to
+                # survive the same gates and lands in `notes` the same way.
+                proposer = _agent_attempt if agent else _attempt
+                try:
+                    with esc:
+                        block, rep = await proposer(escalation_llm, "escalated",
+                                                    escalation_rounds)
+                        esc.done(accepted=block is not None,
+                                 rejected_by=("" if block is not None
+                                              else str(rep.get("action") or "")))
+                except Exception as ex:
+                    # This branch is already dying; an escalation that raises
+                    # must not convert a loud, recorded stage-T failure into a
+                    # crashed run. `esc.record` carries the exception and the
+                    # cost, so it is survivable without being invisible.
+                    block = None
+                    print(f"[types] escalation raised: "
+                          f"{type(ex).__name__}: {ex}")
+                finally:
+                    if escalations is not None:
+                        escalations.append(esc.record)
+                if block is not None:
+                    return block, glossary if isinstance(glossary, dict) else {}
 
         # keep the last draw (the compile loop and the assembled crate's stub
         # gate still get a say) but make it loud in the log AND in the record —

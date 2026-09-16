@@ -19,17 +19,41 @@ DEPRECATED_CONFIG_KEYS = {
     "bindgen_bin", "bindgen_clang_args", "c_source_root",
 }
 
+# Deployment-specific values are read from the environment rather than written
+# here, because this repo is intended to go public and a checked-in GCP project
+# id or an absolute key path is deployment detail nobody else can use anyway.
+# Nothing SECRET has ever lived in this file — the vLLM keys and the Vertex
+# service-account JSON are separate files outside the repo — but an identifier
+# is still worth not publishing.
+#
+#   DIFFUSIONMTUS_KEYS_DIR   dir holding the per-server api_key.txt files.
+#                            Defaults to this checkout's parent, which is the
+#                            existing layout, so local runs need no env at all.
+#   VERTEX_PROJECT_ID        GCP project for the Anthropic-on-Vertex backend.
+#   VERTEX_REGION            defaults to "global".
+#
+# A Claude model requested without VERTEX_PROJECT_ID fails in `_make_client`
+# with a named error, the same way a missing GOOGLE_APPLICATION_CREDENTIALS
+# does — deployment config missing should say so, not 404 halfway through a run.
+_KEYS_DIR = Path(os.environ.get(
+    "DIFFUSIONMTUS_KEYS_DIR", Path(__file__).resolve().parent.parent))
+_VERTEX = {
+    "backend": "anthropic-vertex",
+    "project_id": os.environ.get("VERTEX_PROJECT_ID", ""),
+    "region": os.environ.get("VERTEX_REGION", "global"),
+}
+
 # served-model-name -> which vLLM server instance serves it. Add an entry
 # here whenever a new model is stood up so worker_model/rustgen_model in a
 # config file resolve to the right endpoint automatically.
 MODEL_SERVERS = {
     "gemma-4-26b-a4b": {
         "base_url": "http://127.0.0.1:8000/v1",
-        "api_key_file": "/nobackup2/alleshwaram/CtoRust/gemma4-vllm/api_key.txt",
+        "api_key_file": str(_KEYS_DIR / "gemma4-vllm/api_key.txt"),
     },
     "gemma-4-31b": {
         "base_url": "http://127.0.0.1:8001/v1",
-        "api_key_file": "/nobackup2/alleshwaram/CtoRust/gemma4-31b-vllm/api_key.txt",
+        "api_key_file": str(_KEYS_DIR / "gemma4-31b-vllm/api_key.txt"),
     },
     # Second instance of the SAME weights, tensor-parallel over the other two
     # GPUs. Two servers rather than two runs sharing one: vLLM interleaves
@@ -38,7 +62,7 @@ MODEL_SERVERS = {
     # being measured is run-to-run variance.
     "gemma-4-31b-b": {
         "base_url": "http://127.0.0.1:8002/v1",
-        "api_key_file": "/nobackup2/alleshwaram/CtoRust/gemma4-31b-b-vllm/api_key.txt",
+        "api_key_file": str(_KEYS_DIR / "gemma4-31b-b-vllm/api_key.txt"),
     },
     # Anthropic models via Google Vertex AI. NOT a vLLM server — `backend`
     # switches llm.py onto the Anthropic SDK, and base_url/api_key_file do not
@@ -52,16 +76,8 @@ MODEL_SERVERS = {
     # are dropped for this backend, and adaptive thinking — which Gemma has no
     # equivalent for — is on by default. So a Claude-vs-Gemma run is each model
     # at ITS OWN defaults, not one variable changed. Say so in any write-up.
-    "claude-sonnet-5": {
-        "backend": "anthropic-vertex",
-        "project_id": "cs-trustworthy-ai-43a8",
-        "region": "global",
-    },
-    "claude-opus-5": {
-        "backend": "anthropic-vertex",
-        "project_id": "cs-trustworthy-ai-43a8",
-        "region": "global",
-    },
+    "claude-sonnet-5": dict(_VERTEX),
+    "claude-opus-5": dict(_VERTEX),
 }
 
 
@@ -188,6 +204,49 @@ class Config:
     rustgen_output_formats: bool = True   # OUTPUT FORMATS block
     rustgen_exit_status: bool = True      # EXIT STATUS block (exit_status.py)
     rustgen_callback_params: bool = True  # CALLBACK PARAMETERS block (bug class 7)
+
+    # --- model escalation (see ../plan.md) ---
+    # A stronger model standing in at the three points where the cheap one has
+    # already given up. NOT one of the rustgen_* ablation knobs: those default
+    # True because they gate SHIPPED behaviour, whereas this is off until
+    # measured. `escalation_model` is the master switch — empty means no
+    # escalation anywhere, so every existing config keeps today's semantics
+    # with no edits, and the per-site booleans below are subordinate to it.
+    escalation_model: str = ""            # a MODEL_SERVERS name, e.g. claude-opus-5
+    escalate_types: bool = True           # stage T, on repair exhaustion
+    escalate_compile: bool = True         # compile loop ending above final: 0
+    escalate_stubs: bool = True           # stub residue after repair_stubs
+    # Ceiling on the compile site. SWEPT over 140 recorded per-run logs
+    # 2026-08-11 (mtu_runs/abl2/sweep_finals.py): of 37 build failures, 18 sit
+    # at exactly `final: 1` and 25 at <= 3, while the tail runs 10/19/19/24/34.
+    # A run at 1-3 errors is a REPAIR; the tail is a rewrite, and buying
+    # rewrites from an expensive model defeats the point of a cheap pipeline.
+    escalation_max_errors: int = 3
+    # Bounds. `call_deadline` bounds ONE logical call; nothing bounded a
+    # multi-turn loop, and the consequence changed when the backend started
+    # billing — an unbounded vLLM loop burned GPU time already paid for, an
+    # unbounded Vertex loop bills. Recorded as well as enforced.
+    escalation_max_turns: int = 6         # per firing
+    escalation_max_tokens: int = 4000     # per call
+    escalation_run_token_budget: int = 120000  # per RUN, across every firing
+    # --- agent-scoped escalation (plan.md item 6) ---
+    # Subordinate to `escalation_model` like the per-site booleans: with no
+    # model there is nothing to escalate to. OFF by default because it is a
+    # strictly wider surface than the question-menu loop it replaces, and the
+    # batch that justifies it has not been run.
+    escalation_agent: bool = False
+    # The bounds `escalation_max_turns` does NOT cover. That knob counts model
+    # turns; an agent's reads are cheap individually and unbounded in aggregate,
+    # and one unbounded read of a large C file can eat a run's token budget in a
+    # single call. A turn cap does not bound tool calls and `call_deadline` does
+    # not bound a loop.
+    escalation_agent_max_tool_calls: int = 40    # per firing
+    escalation_agent_wall_seconds: float = 600.0  # per firing
+    # The agent reads the translator's OWN source. Deliberate and it is the only
+    # reason site A is reachable: the `pub mod deps` refusal is diagnosable only
+    # by reading `common.py`'s `_DEPS_MOD` and discovering the gate wants
+    # `*_deps`. No amount of crate-and-C context gets there.
+    escalation_agent_reads_pipeline: bool = True
     # How much of the MTU's original C the spec/code stages may see:
     #   "off"      — description + invariants only (the MTU philosophy)
     #   "literals" — just the string/char/numeric literals from the unit's C

@@ -808,8 +808,27 @@ def parse_cluster_reply(reply: str) -> dict[str, str]:
 async def compile_loop(cfg: Config, llm: LLM, crate: Path,
                        units: list[Explanation], specs: dict[str, dict],
                        types_rs: str, code: dict[str, str],
-                       reassemble, ffi_rs: str = ""
+                       reassemble, ffi_rs: str = "",
+                       agent_staged=None, agent_budget=None,
+                       agent_records: list[dict] | None = None
                        ) -> tuple[str, dict[str, str], str, CompileReport]:
+    """`agent_staged` (plan.md item 6, site B) swaps ONE tier — the cluster
+    repair — for an agent proposing an atomic transaction. Everything else is
+    untouched, including every other repair tier and the best-state tracking.
+
+    Why that tier and only that tier. The cluster repair is already the
+    multi-section one, and it is already the one that can leave a cross-section
+    change half-applied: it calls `set_section` per section in a loop, each
+    gated independently, so section A can land while section B is refused. The
+    loop then measures a worse crate and reverts, having spent a round and a
+    revert. `check_transaction` makes that state unreachable rather than
+    detected — the same preference for preserving over checking that
+    `splice_function` was built on.
+
+    The agent also gets the C source, which this loop has NEVER had: no repair
+    prompt here carries it, so every compile repair to date has been made
+    without reference to what the code was translated FROM.
+    """
     report = CompileReport(total_units=len(units))
     units_by_id = {u.id: u for u in units}
     best: tuple | None = None          # (n_errors, types, code, ffi, dirty_sections)
@@ -1012,7 +1031,62 @@ async def compile_loop(cfg: Config, llm: LLM, crate: Path,
             return
         set_section(sid, extract_rust(reply))
 
+    async def repair_cluster_agent(sids: frozenset, errs: list[dict]) -> None:
+        """Site B's agent tier. Proposes across the cluster, lands atomically.
+
+        Sections OUTSIDE the cluster stay untouchable, exactly as in the
+        non-agent tier: a wider read surface is not a licence to rewrite
+        sections the error set never implicated, and `ranked` is the whole
+        authority for what may change.
+        """
+        from rustgen.agent import run_agent
+        from rustgen.agent_sites import cluster_task
+        from rustgen.transaction import check_transaction
+
+        ranked = sorted(sids)[:MAX_CLUSTER]
+        secs = sections_code()
+        task = cluster_task(
+            ranked,
+            render_sections(ranked),
+            render_errors(errs, cfg.rustgen_max_errors_per_section * 2)
+            + missing_capability_notes(errs, secs))
+        res = await run_agent(llm, agent_staged, task, budget=agent_budget,
+                              max_tokens=cfg.rustgen_repair_max_tokens * 2)
+        rec = {"type": "agent_site", "site": "compile",
+               "cluster": ranked, "errors": len(errs), "agent": res.record}
+        if res.action != "propose" or not res.edits:
+            rec["outcome"] = f"agent_{res.action}"
+            rec["accepted"] = False
+            if agent_records is not None:
+                agent_records.append(rec)
+            return
+        edits = {k: v for k, v in res.edits.items() if k in ranked}
+        outside = sorted(set(res.edits) - set(ranked))
+        if outside:
+            rec["refused_sections"] = outside
+        tx = check_transaction(secs, edits, shared_id=SHARED)
+        rec["transaction"] = tx.record
+        rec["accepted"] = tx.accepted
+        rec["outcome"] = "applied" if tx.accepted else "transaction_refused"
+        if agent_records is not None:
+            agent_records.append(rec)
+        if not tx.accepted:
+            report.rejected_repairs.append(
+                {"section": ",".join(ranked),
+                 "problem": f"agent transaction refused: "
+                            f"{tx.problems[0]['problem'] if tx.problems else '?'}"})
+            print(f"[compile] {tx.summary()}")
+            return
+        # Atomic: every section or none. Written through the SAME `set_section`
+        # so no gate is bypassed — `check_transaction` is an additional
+        # all-or-nothing check in front of it, never a replacement for it.
+        for sid, new_code in tx.sections.items():
+            if sid in edits:
+                set_section(sid, new_code)
+
     async def repair_cluster(sids: frozenset, errs: list[dict]) -> None:
+        if agent_staged is not None:
+            return await repair_cluster_agent(sids, errs)
         ranked = sorted(sids)[:MAX_CLUSTER]
         reply = await llm.ask(REPAIR_CLUSTER_PROMPT.format(
             types_rs=types_rs,

@@ -442,7 +442,7 @@ class StubContext:
             return f"(no function named `{name}` in this crate)"
         return self.crate[m.start():m.start() + 250].split("{")[0].strip()
 
-    def callers_of(self, name: str) -> str:
+    def _call_evidence(self, name: str) -> list[str]:
         name = name.strip().split("::")[-1]
         out = []
         for m in re.finditer(rf"\b{re.escape(name)}\s*\(", self.blanked):
@@ -455,10 +455,29 @@ class StubContext:
             out.append(f"  crate line {line}: {text}")
         for site in self.call_texts.get(name, [])[:6]:
             out.append(f"  C call site: {site}")
+        return out
+
+    def has_callers(self, name: str) -> bool:
+        """Is there ANY evidence of how `name` is used — a crate call site or a
+        C one? The structured form of `callers_of`, because site C's gate has
+        to branch on this and matching the prose below would be a check that
+        breaks the next time the sentence is reworded.
+
+        `blind` deliberately does NOT apply. This is not an answer handed to a
+        model, it is the pipeline deciding whether to spend money, and the
+        blind arm exists to starve the MODEL of context, not to make the
+        pipeline forget what it knows.
+        """
+        return bool(self._call_evidence(name))
+
+    def callers_of(self, name: str) -> str:
+        out = self._call_evidence(name)
         if not out:
-            return (f"Nothing calls `{name}` — not in this crate and not in the "
-                    f"C. There is no evidence of what it should do.")
-        return f"Calls to `{name}`:\n" + "\n".join(out[:10])
+            return (f"Nothing calls `{name.strip().split('::')[-1]}` — not in "
+                    f"this crate and not in the C. There is no evidence of "
+                    f"what it should do.")
+        return (f"Calls to `{name.strip().split('::')[-1]}`:\n"
+                + "\n".join(out[:10]))
 
     def c_source_of(self, name: str) -> str:
         name = name.strip()
@@ -519,6 +538,44 @@ class StubReport:
         return (f"[stubs] {self.considered} considered, {self.resolved} resolved, "
                 f"{self.gave_up} declined, {self.rejected} patch(es) rejected, "
                 f"{self.skipped_shared} in shared types (untouchable)")
+
+
+def unanswerable_stubs(stubs: list[Stub], ctx: StubContext) -> list[Stub]:
+    """Residual stubs no model can resolve, however strong.
+
+    The class-7 second sub-case: a library API function the CLI never calls.
+    No call site in the crate, none in the C, nothing to infer the behaviour
+    from. A stronger model does not create information the project does not
+    contain — it either declines (correct) or invents (worse), and an invented
+    callback with the right type compiles clean and is silently wrong.
+    """
+    return [s for s in stubs if s.function and not ctx.has_callers(s.function)]
+
+
+def should_escalate_stubs(sections: dict[str, str], ctx: StubContext,
+                          shared_id: str = "") -> tuple[bool, str]:
+    """Site C's gate: escalate the residue, or spend nothing. (fire, why_not).
+
+    ALL OR NOTHING, and that is the whole design. `remaining_stubs` voids a
+    crate for ONE stub, so the value curve is a step function at zero:
+    `cc_array base` cleared 5 stubs and stayed STUB_CRATE in all 6 runs.
+    Clearing four of five buys exactly nothing, so if any residual stub is
+    unanswerable the correct spend is zero rather than four fifths of the way.
+
+    This is also why the escalated pass takes the whole set at once rather than
+    one stub at a time: per-stub escalation optimises a quantity that does not
+    move the verdict.
+    """
+    stubs = [s for s in find_open_stubs(sections, shared_id) if s.patchable]
+    if not stubs:
+        return False, "no patchable stubs remain"
+    dead = unanswerable_stubs(stubs, ctx)
+    if dead:
+        names = ", ".join(sorted({s.function for s in dead})[:4])
+        return False, (f"{len(dead)} of {len(stubs)} residual stub(s) have no "
+                       f"call site in the crate or the C ({names}) — the crate "
+                       f"cannot be cleared, so clearing the rest buys nothing")
+    return True, ""
 
 
 def validate_stub_patch(old: str, new: str, stub: Stub) -> str:

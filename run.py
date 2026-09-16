@@ -51,7 +51,7 @@ async def run_one(strategy_name: str, source: str, source_path: Path, out_root: 
     store = Store(out_root / stem)
     store.write_record(cfg.to_record())
     store.event("start", strategy=strategy_name, file=str(source_path))
-    llm = LLM(cfg)
+    llm = LLM(cfg, role="worker")
     strategy = STRATEGIES[strategy_name](cfg, llm, store)
 
     t0 = time.time()

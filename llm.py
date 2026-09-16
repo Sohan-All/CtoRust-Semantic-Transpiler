@@ -42,6 +42,12 @@ def _make_client(model: str, timeout: int = 900):
                 "GOOGLE_APPLICATION_CREDENTIALS is not set — the Vertex "
                 "backend authenticates with a GCP service-account JSON, not "
                 "an API key. Point it at the credentials file.")
+        if not server.get("project_id"):
+            raise SystemExit(
+                f"VERTEX_PROJECT_ID is not set — {model!r} runs on Vertex and "
+                "needs a GCP project. It is deployment config and is read from "
+                "the environment rather than checked into config.py; export it "
+                "(and VERTEX_REGION if not 'global') before the run.")
         return AsyncAnthropicVertex(project_id=server["project_id"],
                                     region=server["region"],
                                     timeout=timeout, max_retries=0)
@@ -145,8 +151,16 @@ class _Reply:
 
 
 class LLM:
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config, role: str = "worker"):
         self.cfg = cfg
+        # Which PHASE this instance serves: "worker" (MTU discovery), "rustgen"
+        # (stages T/S/C and the compile loop) or "escalation" (a stronger model
+        # standing in where the cheap one gave up). A run already builds one LLM
+        # per model — `dataclasses.replace(base, worker_model=...)` — and each
+        # emits its own usage record, but until this label existed those records
+        # were indistinguishable in the stream, so per-model cost could not be
+        # recovered afterwards. It is a label only; nothing branches on it.
+        self.role = role
         self.backend = backend_of(cfg.worker_model)
         # Cleared the first time Vertex's org policy rejects a constrained
         # request; see _ask_anthropic.
@@ -439,8 +453,15 @@ class LLM:
         raise ValueError(f"no valid JSON after retries: {last_err}")
 
     def usage_record(self) -> dict:
+        # `model` and `role` are what make a multi-model run auditable: the
+        # cheap and the expensive model each emit one of these, and the whole
+        # point of escalation is the ratio between them. A record without them
+        # can only answer "what did this run cost", never "what did the
+        # escalation cost", which is the question the work exists to answer.
         return {
             "type": "event", "event": "usage",
+            "model": self.cfg.worker_model,
+            "role": self.role,
             "calls": self.calls,
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,

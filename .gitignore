@@ -10,3 +10,17 @@ out/
 
 # OS
 .DS_Store
+
+# Credentials. Defence in depth only: nothing secret has ever been committed
+# here (verified over the full history 2026-08-11), and the real files live
+# OUTSIDE this checkout — the vLLM keys in the per-server dirs, the Vertex
+# service-account JSON at the tree root, pointed at by
+# GOOGLE_APPLICATION_CREDENTIALS. These patterns exist so that a copy
+# accidentally dropped into the repo is ignored rather than published.
+*credentials*.json
+gcp-credentials.json
+*api_key*
+*.pem
+service-account*.json
+.env
+.env.*
