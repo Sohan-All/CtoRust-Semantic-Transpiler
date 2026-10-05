@@ -10,11 +10,16 @@
 # the extra. Installing plain `anthropic` fails at client construction partway
 # into a run rather than at import — the worst place to learn about it.
 
-openai>=2.45.0                # llm.py — the local vLLM servers speak the OpenAI API
-anthropic[vertex]>=0.120.2    # llm.py — Claude on Vertex (see note above)
-tree-sitter>=0.26.0           # chunker.py — C decomposition
-tree-sitter-c>=0.24.2         # chunker.py, project_index.py — the C grammar
+# Each cap is the NEXT major after the verified version, not an arbitrary
+# ceiling: with bare `>=` floors a fresh install resolved openai 3.24.0 and
+# anthropic 1.11.0 — both a major past anything this code has run against,
+# and neither verified here. Patches and minors are still free to float.
+
+openai>=2.45.0,<3             # llm.py — the local vLLM servers speak the OpenAI API
+anthropic[vertex]>=0.120.2,<1 # llm.py — Claude on Vertex (see note above)
+tree-sitter>=0.26.0,<1        # chunker.py — C decomposition
+tree-sitter-c>=0.24.2,<1      # chunker.py, project_index.py — the C grammar
 
 # Tests only. test_degradation.py constructs httpx errors to drive the
 # transport retry path without standing up a server.
-httpx>=0.28.1
+httpx>=0.28.1,<1
