@@ -11,13 +11,10 @@ the four `handle_*` ones below are what catch it.
 
 from __future__ import annotations
 
-import pathlib
 import sys
 
 from exit_status import analyze_project, interesting
-
-CORPUS = pathlib.Path(
-    "/nobackup2/alleshwaram/CtoRust/Test-Corpus/Public-Tests/B03_organic")
+from testpaths import CORPUS
 
 _failures: list[str] = []
 

@@ -30,6 +30,7 @@ import asyncio
 import sys
 
 from state import Explanation
+from testpaths import RUNS
 
 _failures: list[str] = []
 
@@ -493,9 +494,8 @@ def test_parse_regression_on_real_trial4() -> None:
     from pathlib import Path
     from rustgen.common import parse_regression
 
-    state = Path("/nobackup2/alleshwaram/CtoRust/mtu_runs/abl2/runs/"
-                 "double_linked_list_base_srvA_t4/_project_B03_organic/"
-                 "files/editor/state.jsonl")
+    state = RUNS / ("double_linked_list_base_srvA_t4/_project_B03_organic/"
+                    "files/editor/state.jsonl")
     if not state.exists():
         print("  SKIP  fixture run not on disk")
         return
@@ -621,9 +621,8 @@ def test_emptied_blocks_on_real_fixture() -> None:
     from pathlib import Path
     from rustgen.common import emptied_blocks
 
-    state = Path("/nobackup2/alleshwaram/CtoRust/mtu_runs/abl2/runs/"
-                 "binary_heap_base_srvB_t1/_project_B03_organic/"
-                 "files/scheduler/state.jsonl")
+    state = RUNS / ("binary_heap_base_srvB_t1/_project_B03_organic/"
+                    "files/scheduler/state.jsonl")
     if not state.exists():
         print("  SKIP  fixture run not on disk")
         return
@@ -672,7 +671,7 @@ def test_remaining_stubs_on_real_crates() -> None:
     from pathlib import Path
     from rustgen.common import remaining_stubs
 
-    runs = Path("/nobackup2/alleshwaram/CtoRust/mtu_runs/abl2/runs")
+    runs = RUNS
     if not runs.exists():
         print("  SKIP  runs not on disk")
         return
@@ -768,7 +767,7 @@ def test_emptied_blocks_both_fixtures() -> None:
     from pathlib import Path
     from rustgen.common import emptied_blocks
 
-    runs = Path("/nobackup2/alleshwaram/CtoRust/mtu_runs/abl2/runs")
+    runs = RUNS
     if not runs.exists():
         print("  SKIP  runs not on disk")
         return
@@ -1026,8 +1025,7 @@ def test_illegal_type_bodies() -> None:
     # because a checker that fires on a third of all types blocks is noise.
     import json, glob
     flagged = total = 0
-    for f in glob.glob("/nobackup2/alleshwaram/CtoRust/mtu_runs/abl2/runs/*/"
-                       "_project_B03_organic/files/*/state.jsonl"):
+    for f in glob.glob(str(RUNS / "*/_project_B03_organic/files/*/state.jsonl")):
         for line in open(f):
             try:
                 d = json.loads(line)
@@ -1047,8 +1045,7 @@ def test_illegal_type_bodies() -> None:
     # shared REPAIR, which is why gating stage T alone would not have caught
     # it and set_section carries the same check.
     recs = [json.loads(l) for l in open(
-        "/nobackup2/alleshwaram/CtoRust/mtu_runs/abl2/runs/binary_heap_base_srvA_t5/"
-        "_project_B03_organic/project.jsonl")]
+        RUNS / "binary_heap_base_srvA_t5/_project_B03_organic/project.jsonl")]
     pt = [r for r in recs if r.get("type") == "project_types_all"]
     if len(pt) >= 2:
         check("the shared block was clean before the repair",

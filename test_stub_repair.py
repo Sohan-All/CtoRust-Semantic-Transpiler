@@ -32,6 +32,7 @@ import glob
 import sys
 
 from state import Explanation
+from testpaths import RUNS, SCORE
 from rustgen.stub_repair import (SHARED_ID, Stub, StubContext, find_open_stubs,
                                  repair_stubs, validate_stub_patch)
 
@@ -362,12 +363,12 @@ def test_finds_the_stubs_in_the_recorded_crates() -> None:
     # silently returned "runs" when this tree moved under CtoRust/, so every
     # verdict lookup missed and the test passed 0 crates through both arms
     # while still reporting a failure that read like a corpus problem.
-    runs = "/nobackup2/alleshwaram/CtoRust/mtu_runs/abl2/runs"
+    runs = str(RUNS)
     pat = f"{runs}/*/_project_*/rust_crate/src/lib.rs"
     voided = clean = 0
     for f in glob.glob(pat):
         tag = f[len(runs) + 1:].split("/")[0]
-        vf = f"/nobackup2/alleshwaram/CtoRust/mtu_runs/abl2/score/{tag}.verdict"
+        vf = f"{SCORE}/{tag}.verdict"
         try:
             verdict = open(vf).read()
         except OSError:
