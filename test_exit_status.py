@@ -14,7 +14,7 @@ from __future__ import annotations
 import sys
 
 from exit_status import analyze_project, interesting
-from testpaths import CORPUS
+from testpaths import CORPUS, skip_unless
 
 _failures: list[str] = []
 
@@ -130,6 +130,12 @@ def test_corpus_noise() -> None:
 
 
 def main() -> int:
+    # Every test here reads the corpus through load(); without it the
+    # ground-truth assertions raise KeyError on a project that was never
+    # loaded, which reads as an analysis bug rather than a missing checkout.
+    if skip_unless(CORPUS, "corpus"):
+        print("\nALL PASS (skipped: no corpus)")
+        return 0
     test_double_linked_list()
     test_return_forms()
     test_no_main()

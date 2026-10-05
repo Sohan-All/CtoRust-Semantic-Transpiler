@@ -456,7 +456,8 @@ deps. Compiling ≠ correct: these are what the equivalence-testing phase is for
 
 - MTU → Rust spec and Rust code generation.
 - Cross-file analysis (external calls are recorded as opaque dependencies).
-- **First lib_swap differential (July 10, `libswap_project/`)** — the local
+- **First lib_swap differential (July 10, `libswap_project/`, since removed
+  from this repo — it was a vendored libgit2 tree)** — the local
   prototype of forclift's lib_swap lane, built without docker. Layout:
   `test_case` (symlink to the libgit2 clar tree), `c_build/` (cmake+ninja →
   baseline `driver` CLI + `libdriver.so`), `lanes/<crate>/` (per-crate hybrid:

@@ -31,3 +31,20 @@ RUNS = Path(os.environ.get(
     "DIFFUSIONMTUS_RUNS", _TREE / "mtu_runs/abl2/runs"))
 SCORE = Path(os.environ.get(
     "DIFFUSIONMTUS_SCORE", _TREE / "mtu_runs/abl2/score"))
+
+
+def skip_unless(root: Path, what: str) -> bool:
+    """True — having printed a SKIP line — when a fixture root is absent.
+
+    "The recording is not on disk" and "the code is wrong" are opposite
+    findings, and without this a fresh clone reports the first as the second.
+    Measured on a clone with no corpus and no `mtu_runs/`: two suites raised
+    (`KeyError: ('cli.c', 'run_script')`, `FileNotFoundError`) and two failed
+    with wording that reads like a translation defect — "stubs found in all 0
+    crates the gate voided" is a true statement about an empty glob and a
+    deeply misleading way to say "you have not checked out the corpus".
+    """
+    if root.exists():
+        return False
+    print(f"  SKIP  {what} not on disk ({root})")
+    return True

@@ -30,7 +30,7 @@ import asyncio
 import sys
 
 from state import Explanation
-from testpaths import RUNS
+from testpaths import RUNS, skip_unless
 
 _failures: list[str] = []
 
@@ -1044,8 +1044,11 @@ def test_illegal_type_bodies() -> None:
     # The motivating run's OWN stage-T output is clean — the body came from a
     # shared REPAIR, which is why gating stage T alone would not have caught
     # it and set_section carries the same check.
-    recs = [json.loads(l) for l in open(
-        RUNS / "binary_heap_base_srvA_t5/_project_B03_organic/project.jsonl")]
+    rec_file = RUNS / "binary_heap_base_srvA_t5/_project_B03_organic/project.jsonl"
+    if not rec_file.exists():
+        print("  SKIP  the motivating run is not on disk")
+        return
+    recs = [json.loads(l) for l in open(rec_file)]
     pt = [r for r in recs if r.get("type") == "project_types_all"]
     if len(pt) >= 2:
         check("the shared block was clean before the repair",

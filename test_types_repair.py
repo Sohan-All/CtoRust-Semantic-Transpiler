@@ -31,7 +31,7 @@ import re
 import sys
 
 from state import Explanation
-from testpaths import RUNS
+from testpaths import RUNS, skip_unless
 from rustgen.common import (illegal_stubs, illegal_type_bodies,
                             lost_type_definitions)
 from rustgen.types_repair import (TypesContext, compile_regression,
@@ -287,6 +287,8 @@ def test_entry_rate_on_recorded_stage_t_output() -> None:
     # Tag is derived RELATIVE to the runs root — see the note in
     # test_stub_repair.py. A hardcoded index breaks silently when this tree
     # moves, and reads as a corpus problem rather than a path problem.
+    if skip_unless(RUNS, "recorded runs"):
+        return
     runs = str(RUNS)
     pat = f"{runs}/*/_project_*/files/*/state.jsonl"
     clean = fires = 0

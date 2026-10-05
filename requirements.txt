@@ -1,0 +1,20 @@
+# Runtime dependencies. Verified 2026-10-05 on Python 3.12.3 against the
+# versions named below, which are the ones every number in TRIALS.md was
+# produced with.
+#
+#     python3 -m venv venv
+#     venv/bin/pip install -r requirements.txt
+#
+# `anthropic[vertex]`, not plain `anthropic`: llm.py's Claude path uses
+# AsyncAnthropicVertex, which imports google.auth, and that arrives only with
+# the extra. Installing plain `anthropic` fails at client construction partway
+# into a run rather than at import — the worst place to learn about it.
+
+openai>=2.45.0                # llm.py — the local vLLM servers speak the OpenAI API
+anthropic[vertex]>=0.120.2    # llm.py — Claude on Vertex (see note above)
+tree-sitter>=0.26.0           # chunker.py — C decomposition
+tree-sitter-c>=0.24.2         # chunker.py, project_index.py — the C grammar
+
+# Tests only. test_degradation.py constructs httpx errors to drive the
+# transport retry path without standing up a server.
+httpx>=0.28.1

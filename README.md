@@ -64,9 +64,28 @@ status, and which of its parameters are callbacks.
 
 ---
 
-## Running it
+## Setup
 
-Use the repo's venv.
+```bash
+python3 -m venv venv
+venv/bin/pip install -r requirements.txt
+```
+
+Python 3.12 and, for the compile loop, a Rust toolchain (`cargo` on `PATH`).
+`Dockerfile` builds both if you would rather not install them.
+
+Two things the pipeline reads but this repo does not ship:
+
+- **A C corpus.** Everything here is written against the TRACTOR
+  [Test-Corpus](https://github.com/DARPA-TRACTOR-Program/Test-Corpus) (MIT,
+  Distribution Statement A), checked out as a sibling of this repo. Tests that
+  need it print `SKIP` when it is absent rather than failing.
+- **Model endpoints.** `config.py` resolves a served-model name to a local vLLM
+  server, reading its key from a file outside this checkout. Nothing is
+  committed here; see `MODEL_SERVERS` and the environment variables documented
+  above it (`DIFFUSIONMTUS_KEYS_DIR`, `VERTEX_PROJECT_ID`, `VERTEX_REGION`).
+
+## Running it
 
 ```bash
 venv/bin/python run_project.py <c_root>
